@@ -3,8 +3,10 @@
 # Distributed example: torchrun --standalone --nnodes=1 --nproc-per-node=6 -m pufferlib.pufferl train puffer_nmmo3
 
 import contextlib
+import pickle
 import warnings
 warnings.filterwarnings('error', category=RuntimeWarning)
+warnings.filterwarnings('ignore', message='.*torch._prims_common.check.*', category=FutureWarning)
 
 import os
 import sys
@@ -55,7 +57,7 @@ from torch.utils.cpp_extension import (
 ADVANTAGE_CUDA = bool(CUDA_HOME or ROCM_HOME)
 
 class PuffeRL:
-    def __init__(self, config, vecenv, policy, logger=None):
+    def __init__(self, config, vecenv, policy, logger=None, eval_weights=None):
         # Backend perf optimization
         torch.set_float32_matmul_precision('high')
         torch.backends.cudnn.deterministic = config['torch_deterministic']
@@ -65,14 +67,27 @@ class PuffeRL:
         seed = config['seed']
         #random.seed(seed)
         #np.random.seed(seed)
+        self.rng = np.random.default_rng(seed)
         #torch.manual_seed(seed)
-
+        self.device = device = config['device']
+        self.vecenv = vecenv
+        
         # Vecenv info
         vecenv.async_reset(seed)
         obs_space = vecenv.single_observation_space
         atn_space = vecenv.single_action_space
         total_agents = vecenv.num_agents
         self.total_agents = total_agents
+
+        # Features of the setup
+        self.multiobjective_reward = hasattr(vecenv, 'reward_dim')
+        self.reward_dim = vecenv.reward_dim if self.multiobjective_reward else 1
+        self.q_value_critic = hasattr(policy, 'q_value_critic') and policy.q_value_critic
+        self.is_multidiscrete = isinstance(atn_space, pufferlib.spaces.MultiDiscrete) 
+        self.weight_conditioning = hasattr(policy, 'weight_conditioning') and policy.weight_conditioning
+        self.eval_weights = None
+        self.action_selection = config['action_selection'] if 'action_selection' in config else 'policy'
+        self.num_policies = config['num_policies'] if 'num_policies' in config else 1
 
         # Experience
         if config['batch_size'] == 'auto' and config['bptt_horizon'] == 'auto':
@@ -91,16 +106,22 @@ class PuffeRL:
                 f'Total agents {total_agents} <= segments {segments}'
             )
 
-        device = config['device']
         self.observations = torch.zeros(segments, horizon, *obs_space.shape,
             dtype=pufferlib.pytorch.numpy_to_torch_dtype_dict[obs_space.dtype],
             pin_memory=device == 'cuda' and config['cpu_offload'],
             device='cpu' if config['cpu_offload'] else device)
         self.actions = torch.zeros(segments, horizon, *atn_space.shape, device=device,
             dtype=pufferlib.pytorch.numpy_to_torch_dtype_dict[atn_space.dtype])
-        self.values = torch.zeros(segments, horizon, device=device)
+                
+        value_shape = (segments, horizon)
+        if self.multiobjective_reward:
+            value_shape = (*value_shape, self.reward_dim)
+            self.rewards = torch.zeros(segments, horizon, self.reward_dim, device=device)
+            self.weights = torch.zeros(segments, horizon, self.reward_dim, device=device)
+        else:
+            self.rewards = torch.zeros(segments, horizon, device=device)
+        self.values = torch.zeros(*value_shape, device=device)
         self.logprobs = torch.zeros(segments, horizon, device=device)
-        self.rewards = torch.zeros(segments, horizon, device=device)
         self.terminals = torch.zeros(segments, horizon, device=device)
         self.truncations = torch.zeros(segments, horizon, device=device)
         self.ratio = torch.ones(segments, horizon, device=device)
@@ -199,7 +220,6 @@ class PuffeRL:
 
         # Initializations
         self.config = config
-        self.vecenv = vecenv
         self.epoch = 0
         self.global_step = 0
         self.last_log_step = 0
@@ -214,6 +234,19 @@ class PuffeRL:
         # Dashboard
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
         self.print_dashboard(clear=True)
+
+    # TODO PHM: This whole weight setting can go now
+    def set_weights(self, weights):
+        # Set weights on the vectorized environment
+        eval_weights_np = np.asarray(weights, dtype=np.float32)
+        if eval_weights_np.ndim > 1:
+            # Only a single weight vector can be used for policy conditioning
+            eval_weights_np = eval_weights_np[0]
+        self.vecenv.set_weights(eval_weights_np)
+        
+        # Set eval weights for use during evaluation
+        eval_weights_tensor = torch.as_tensor(weights, dtype=torch.float32, device=self.device)
+        self.eval_weights = eval_weights_tensor
 
     @property
     def uptime(self):
@@ -243,7 +276,10 @@ class PuffeRL:
         self.full_rows = 0
         while self.full_rows < self.segments:
             profile('env', epoch)
-            o, r, d, t, info, env_id, mask = self.vecenv.recv()
+            if self.multiobjective_reward:
+                o, r, w, d, t, info, env_id, mask = self.vecenv.recv()
+            else:
+                o, r, d, t, info, env_id, mask = self.vecenv.recv()
 
             profile('eval_misc', epoch)
             env_id = slice(env_id[0], env_id[-1] + 1)
@@ -255,6 +291,7 @@ class PuffeRL:
             o = torch.as_tensor(o)
             o_device = o.to(device)#, non_blocking=True)
             r = torch.as_tensor(r).to(device)#, non_blocking=True)
+            w = torch.as_tensor(w).to(device) if self.multiobjective_reward else None
             d = torch.as_tensor(d).to(device)#, non_blocking=True)
 
             profile('eval_forward', epoch)
@@ -270,8 +307,31 @@ class PuffeRL:
                     state['lstm_h'] = self.lstm_h[env_id.start]
                     state['lstm_c'] = self.lstm_c[env_id.start]
 
-                logits, value = self.policy.forward_eval(o_device, state)
-                action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
+                if not self.weight_conditioning or self.eval_weights is None:
+                    conditioning_weights = [None]
+                else:
+                    conditioning_weights = get_conditioning_weights(
+                        self.num_policies, self.reward_dim, self.rng, self.eval_weights, self.device
+                    )
+
+                # All we might need for policy improvement-like action selection is the Q values
+                q_values = []
+                for weight in conditioning_weights:
+                    if weight is not None:
+                        # Eval weights are given as 1D vectors, need to expand to batch size
+                        weight = weight.unsqueeze(0).expand(o.shape[0], -1)
+                    state['weight'] = weight if weight is not None else w
+                    if self.q_value_critic:
+                        logits, q_value = self.policy.forward_eval(o_device, state)
+                        q_values.append(q_value)
+                        value = compute_value(q_value, logits, self.multiobjective_reward)
+                    else:
+                        logits, value = self.policy.forward_eval(o_device, state)
+                if len(q_values) > 0:
+                    q_values = torch.stack(q_values, dim=0)  # [num_policies, batch, ...]
+
+                # Unified API for action selection
+                action, logprob = select_action(self.action_selection, logits, q_values, self.eval_weights, self.vecenv.action_space)
                 r = torch.clamp(r, -1, 1)
 
             profile('eval_copy', epoch)
@@ -290,10 +350,15 @@ class PuffeRL:
                     self.observations[batch_rows, l] = o_device
 
                 self.actions[batch_rows, l] = action
-                self.logprobs[batch_rows, l] = logprob
+                if logprob is not None:
+                    self.logprobs[batch_rows, l] = logprob
                 self.rewards[batch_rows, l] = r
                 self.terminals[batch_rows, l] = d.float()
-                self.values[batch_rows, l] = value.flatten()
+                if self.multiobjective_reward:
+                    self.weights[batch_rows, l] = w
+                    self.values[batch_rows, l] = value
+                else:
+                    self.values[batch_rows, l] = value.flatten()
 
                 # Note: We are not yet handling masks in this version
                 self.ep_lengths[env_id] += 1
@@ -345,18 +410,26 @@ class PuffeRL:
         anneal_beta = b0 + (1 - b0)*a*self.epoch/self.total_epochs
         self.ratio[:] = 1
 
+        adv_function = compute_puff_mo_advantage if self.multiobjective_reward else compute_puff_advantage
+        nan_losses = False
+
         for mb in range(self.total_minibatches):
             profile('train_misc', epoch)
             self.amp_context.__enter__()
 
             shape = self.values.shape
             advantages = torch.zeros(shape, device=device)
-            advantages = compute_puff_advantage(self.values, self.rewards,
+            advantages = adv_function(self.values, self.rewards,
                 self.terminals, self.ratio, advantages, config['gamma'],
                 config['gae_lambda'], config['vtrace_rho_clip'], config['vtrace_c_clip'])
+            # Scalarize for priority computation if multi-objective
+            if self.multiobjective_reward:
+                scalarized_advantages = (advantages * self.weights).sum(dim=-1)
+            else:
+                scalarized_advantages = advantages
 
             # Prioritize experience by advantage magnitude
-            adv = advantages.abs().sum(axis=1)
+            adv = scalarized_advantages.abs().sum(axis=1)
             prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
             prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6)
             idx = torch.multinomial(prio_probs, self.minibatch_segments)
@@ -367,6 +440,8 @@ class PuffeRL:
             mb_actions = self.actions[idx]
             mb_logprobs = self.logprobs[idx]
             mb_rewards = self.rewards[idx]
+            if self.multiobjective_reward:
+                mb_weights = self.weights[idx]
             mb_terminals = self.terminals[idx]
             mb_truncations = self.truncations[idx]
             mb_ratio = self.ratio[idx]
@@ -377,14 +452,23 @@ class PuffeRL:
             profile('train_forward', epoch)
             if not config['use_rnn']:
                 mb_obs = mb_obs.reshape(-1, *self.vecenv.single_observation_space.shape)
+                if self.multiobjective_reward:
+                    mb_weights = mb_weights.reshape(-1, self.reward_dim)
 
             state = dict(
                 action=mb_actions,
                 lstm_h=None,
                 lstm_c=None,
             )
+            
+            if self.multiobjective_reward:
+                state['weight'] = mb_weights
 
-            logits, newvalue = self.policy(mb_obs, state)
+            if self.q_value_critic:
+                logits, new_q_value = self.policy(mb_obs, state)
+                newvalue = compute_value(new_q_value, logits, self.multiobjective_reward)
+            else:
+                logits, newvalue = self.policy(mb_obs, state)
             actions, newlogprob, entropy = pufferlib.pytorch.sample_logits(logits, action=mb_actions)
 
             profile('train_misc', epoch)
@@ -405,8 +489,15 @@ class PuffeRL:
             #     config['vtrace_rho_clip'], config['vtrace_c_clip'])
 
             # Weight advantages by priority and normalize
-            adv = mb_advantages
-            adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8)
+            if self.multiobjective_reward:
+                adv = (mb_advantages * mb_weights).sum(dim=-1)
+            else:
+                adv = mb_advantages
+            
+            # Ensure numerical stability in normalization
+            adv_mean = adv.mean()
+            adv_std = adv.std()
+            adv = mb_prio * (adv - adv_mean) / (adv_std + 1e-8)
 
             # Losses
             pg_loss1 = -adv * ratio
@@ -417,7 +508,13 @@ class PuffeRL:
             v_clipped = mb_values + torch.clamp(newvalue - mb_values, -vf_clip, vf_clip)
             v_loss_unclipped = (newvalue - mb_returns) ** 2
             v_loss_clipped = (v_clipped - mb_returns) ** 2
-            v_loss = 0.5*torch.max(v_loss_unclipped, v_loss_clipped).mean()
+            v_loss_per_obj = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped)
+            
+            if self.multiobjective_reward:
+                weighted_v_loss = v_loss_per_obj * mb_weights
+                v_loss = weighted_v_loss.sum(dim=-1).mean()
+            else:
+                v_loss = v_loss_per_obj.mean()
 
             entropy_loss = entropy.mean()
 
@@ -679,6 +776,112 @@ def compute_puff_advantage(values, rewards, terminals,
 
     return advantages
 
+def compute_puff_mo_advantage(values, rewards, terminals,
+        ratio, advantages, gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip):
+    '''CUDA kernel for puffer multiobjective advantage with automatic CPU fallback. You need
+    nvcc (in cuda-dev-tools or in a cuda-dev docker base) for PufferLib to
+    compile the fast version.'''
+
+    device = values.device
+    if not ADVANTAGE_CUDA:
+        values = values.cpu()
+        rewards = rewards.cpu()
+        terminals = terminals.cpu()
+        ratio = ratio.cpu()
+        advantages = advantages.cpu()
+
+    torch.ops.pufferlib.compute_puff_mo_advantage(values, rewards, terminals,
+        ratio, advantages, gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip)
+
+    if not ADVANTAGE_CUDA:
+        return advantages.to(device)
+
+    return advantages
+
+def compute_value(q_values, logits, multiobjective_reward=False):
+    '''Compute state value from Q-values and policy logits.
+    
+    For multidiscrete action spaces, assumes factorized Q-values where
+    Q-values are computed independently for each action dimension.
+    V(s) = sum_i [ sum_{a_i} Q_i(s, a_i) * π(a_i|s) ]
+    '''
+    # Logits are never batched, but q_values might be
+    logits_shape = logits[0].shape if isinstance(logits, tuple) else logits.shape
+    batched_observations = q_values.shape[0] != logits_shape[0]
+    if batched_observations:
+        batch_shape = q_values.shape[:2]
+        if multiobjective_reward:
+            # [segments, horizon, reward_dim, actions] -> [segments*horizon, reward_dim, actions]
+            q_values = q_values.reshape(-1, q_values.shape[-2], q_values.shape[-1])
+        else:
+            # [segments, horizon, actions] -> [segments*horizon, actions]
+            q_values = q_values.reshape(-1, q_values.shape[-1])
+
+    is_multidiscrete = isinstance(logits, tuple)
+    
+    if is_multidiscrete:
+        # logits is a tuple of tensors, one per action dimension
+        # q_values is flattened: [..., sum(action_dims)] or [..., reward_dim, sum(action_dims)]
+
+        # Split probabilities and Q values by action dimension
+        probs_list = [torch.softmax(l, dim=-1) for l in logits]
+        action_dims = [l.shape[-1] for l in logits]
+        q_values_split = torch.split(q_values, action_dims, dim=-1)
+
+        # Compute expected Q-value for each action dimension
+        # V_i = sum_{a_i} Q_i(s, a_i) * π(a_i|s)
+        values_per_dim = []
+        for q, probs in zip(q_values_split, probs_list):
+            if multiobjective_reward:
+                # probs: [batch, action_dim_i] -> [batch, reward_dim, action_dim_i]
+                probs = probs.unsqueeze(-2)
+            # q: [batch, (reward_dim), action_dim_i], probs: [batch, (reward_dim), action_dim_i]
+            v = (q * probs).sum(dim=-1)  # [batch, (reward_dim)]
+            values_per_dim.append(v)
+
+        # Sum values across action dimensions: V(s) = sum_i V_i
+        value = torch.stack(values_per_dim, dim=-1).sum(dim=-1)
+    else:
+        probs = torch.softmax(logits, dim=-1)
+        if multiobjective_reward:
+            probs = probs.unsqueeze(-2)
+        
+        # V(s) = sum_a Q(s,a) * π(a|s)
+        value = (q_values * probs).sum(dim=-1)
+
+    # Reshape back if needed
+    if batched_observations:
+        if multiobjective_reward:
+            value = value.reshape(*batch_shape, -1)
+        else:
+            value = value.reshape(*batch_shape)
+    
+    return value
+
+def get_conditioning_weights(num_policies, reward_dim, rng, eval_weights=None, device='cpu'):
+    if eval_weights.ndim == 1:
+        eval_weights = eval_weights.unsqueeze(0)
+    num_eval_weights = eval_weights.shape[0]
+    num_weights_to_sample = num_policies - num_eval_weights
+    sampled_weights = rng.dirichlet(np.ones(reward_dim), size=num_weights_to_sample)
+    all_weights = torch.as_tensor(sampled_weights, dtype=torch.float32, device=device)
+    if eval_weights is not None:
+        all_weights = torch.cat([eval_weights, all_weights], dim=0)
+    return all_weights
+
+def select_action(action_selection, logits, q_values, weights, action_space=None):
+    if action_selection == "policy":
+        action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
+    elif action_selection == "pi":
+        if isinstance(logits, tuple):  # Multidiscrete
+            action_dims = [l.shape[-1] for l in logits]
+        else:
+            action_dims = None
+        action = pi_action_selection(q_values, weights, action_dims=action_dims)
+        logprob = None
+    else:
+        raise ValueError(f'Unknown action_selection: {action_selection}')
+    return action, logprob
 
 def abbreviate(num, b2, c2):
     if num < 1e3:
@@ -852,6 +1055,10 @@ class NeptuneLogger:
             neptune[k].append(v)
         self.should_upload_model = not args['no_model_upload']
 
+    def define_metrics(self, metrics, summary="mean"):
+        for metric in metrics:
+            self.neptune[metric].track_files(summary)
+
     def log(self, logs, step):
         for k, v in logs.items():
             self.neptune[k].append(v, step=step)
@@ -901,6 +1108,10 @@ class WandbLogger:
             self.upload_model(model_path)
         self.wandb.finish()
 
+    def define_metrics(self, metrics, summary="mean"):
+        for metric in metrics:
+            self.wandb.run.define_metric(metric, summary=summary)
+
     def download(self):
         artifact = self.wandb.use_artifact(f'{self.run_id}:latest')
         data_dir = artifact.download()
@@ -938,12 +1149,17 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop
         model.forward_eval = policy.forward_eval
         policy = model.to(local_rank)
 
+    train_config = { **args['train'], 'env': env_name }
+    train_config.update(args['train'])
+    # Create a tag for the experiment
+    args['tag'] = "Train " + get_tag_for_experiment(train_config, vecenv, policy)
+    train_config = { **args['train'], 'env': env_name }
+
     if args['neptune']:
         logger = NeptuneLogger(args)
     elif args['wandb']:
         logger = WandbLogger(args)
 
-    train_config = { **args['train'], 'env': env_name }
     pufferl = PuffeRL(train_config, vecenv, policy, logger)
 
     # Sweep needs data for early stopped runs, so send data when steps > 100M
@@ -991,20 +1207,67 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop
     pufferl.logger.close(model_path, early_stop=False)
     return all_logs
 
+def get_tag_for_experiment(config, vecenv, policy, eval_weights=None):
+    tag = ""
+    if vecenv.multiobjective_reward: tag = 'MO'
+    if hasattr(policy, "q_value_critic") and policy.q_value_critic: tag += 'Q'
+    tag += 'PPO'
+    if vecenv.multiobjective_reward and not policy.weight_conditioning: tag += ' (w/o conditioning)'
+    if 'action_selection' in config and config['action_selection'] == 'pi':
+        tag += ' + '
+        eval_weights = np.asarray(eval_weights, dtype=np.float32) if eval_weights is not None else None
+        if eval_weights is not None and eval_weights.ndim > 1: tag += 'LEX'  # Lexicographic
+        if 'num_policies' in config and config['num_policies'] > 1: tag += 'G'  # Generalized
+        tag += 'PI'  # Policy Improvement
+    return tag
+
 def eval(env_name, args=None, vecenv=None, policy=None):
     args = args or load_config(env_name)
     backend = args['vec']['backend']
     if backend != 'PufferEnv':
         backend = 'Serial'
 
-    args['vec'] = dict(backend=backend, num_envs=1)
+    seed = args['train']['seed']
+    args['vec'] = dict(backend=backend, num_envs=1, seed=seed)
     vecenv = vecenv or load_env(env_name, args)
-
     policy = policy or load_policy(args, vecenv, env_name)
-    ob, info = vecenv.reset()
+
+    ob, _ = vecenv.reset(seed)
     driver = vecenv.driver_env
     num_agents = vecenv.observation_space.shape[0]
     device = args['train']['device']
+    
+    # Check if environment supports multi-objective rewards
+    multiobjective_reward = hasattr(vecenv, 'reward_dim')
+
+    reward_dim = vecenv.reward_dim if multiobjective_reward else 1
+
+    rng = np.random.default_rng(seed)
+
+    eval_weight_schedule = None
+    if multiobjective_reward:
+        if args['eval_weights']:
+            eval_weight_schedule = {
+                0: np.array([float(w) for w in args['eval_weights'].split(',')]),
+            }
+        if not eval_weight_schedule:
+            # Randomly sample weight
+            eval_weight_schedule = {
+                0: rng.dirichlet(np.ones(reward_dim)),
+            }
+
+    # Use initial weights for checks
+    eval_weights = get_weight_from_schedule(eval_weight_schedule, device=device)
+
+    if not multiobjective_reward:
+        eval_weights = None  # TODO PHM: Ignore eval_weights for now
+    if eval_weights is not None and not multiobjective_reward:
+        raise ValueError('eval_weights can only be used with multi-objective environments')
+    if eval_weights is not None:
+        assert len(eval_weights) == reward_dim, f'Length of eval_weights ({len(eval_weights)}) must match reward_dim ({reward_dim})'
+
+    num_policies = args['eval']['num_policies'] if 'eval' in args and 'num_policies' in args['eval'] else 1
+    action_selection = args['eval']['action_selection'] if 'eval' in args and 'action_selection' in args['eval'] else 'policy'
 
     state = {}
     if args['train']['use_rnn']:
@@ -1013,9 +1276,27 @@ def eval(env_name, args=None, vecenv=None, policy=None):
             lstm_c=torch.zeros(num_agents, policy.hidden_size, device=device),
         )
 
+    if eval_weights is not None:
+        eval_weights = torch.as_tensor(eval_weights, dtype=torch.float32, device=device)
+
+    tick = 0
+    max_ticks = args['env']['max_ticks']
     frames = []
-    while True:
-        render = driver.render()
+    while True if max_ticks == 0 else tick < max_ticks:
+        if multiobjective_reward:
+            if len(eval_weight_schedule.keys()) > 1:  # No need to change weights if only one set of weights (static)
+                new_weights = get_weight_from_schedule(eval_weight_schedule, tick=tick, device=device)
+                if any(new_weights != eval_weights):
+                    eval_weights = new_weights
+                    # Reset RNN state when changing weights to reduce inertia
+                    if args['train']['use_rnn']:
+                        state['lstm_h'] = torch.zeros(num_agents, policy.hidden_size, device=device)
+                        state['lstm_c'] = torch.zeros(num_agents, policy.hidden_size, device=device)
+
+        if args['skip_render']:
+            render = None
+        else:
+            render = driver.render()
         if len(frames) < args['save_frames']:
             frames.append(render)
 
@@ -1033,19 +1314,96 @@ def eval(env_name, args=None, vecenv=None, policy=None):
 
         with torch.no_grad():
             ob = torch.as_tensor(ob).to(device)
-            logits, value = policy.forward_eval(ob, state)
-            action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
+
+            if not policy.weight_conditioning or eval_weights is None:
+                conditioning_weights = [None]
+            else:
+                conditioning_weights = get_conditioning_weights(
+                    num_policies, vecenv.reward_dim, rng, eval_weights, device
+                )
+
+            # All we might need for policy improvement-like action selection is the Q values
+            q_values = []
+            for weight in conditioning_weights:
+                if weight is not None:
+                    # Eval weights are given as 1D vectors, need to expand to batch size
+                    weight = weight.unsqueeze(0).expand(ob.shape[0], -1)
+                state['weight'] = weight
+                if policy.q_value_critic:
+                    logits, q_value = policy.forward_eval(ob, state)
+                    q_values.append(q_value)
+                else:
+                    logits, _ = policy.forward_eval(ob, state)
+            if len(q_values) > 0:
+                q_values = torch.stack(q_values, dim=0)  # [num_policies, batch, ...]
+
+            # Unified API for action selection
+            action, _ = select_action(action_selection, logits, q_values, eval_weights, vecenv.action_space)
             action = action.cpu().numpy().reshape(vecenv.action_space.shape)
+            if isinstance(logits, torch.distributions.Normal):
+                action = np.clip(action, vecenv.action_space.low, vecenv.action_space.high)
 
-        if isinstance(logits, torch.distributions.Normal):
-            action = np.clip(action, vecenv.action_space.low, vecenv.action_space.high)
-
-        ob = vecenv.step(action)[0]
-
+        output = vecenv.step(action)
+        tick += 1
+        ob, terminals, truncations, infos = output[0], *output[-3:]
+        done = (terminals | truncations)
+        if done.all():
+            break
+        
         if len(frames) > 0 and len(frames) == args['save_frames']:
             import imageio
             imageio.mimsave(args['gif_path'], frames, fps=args['fps'], loop=0)
             print(f'Saved {len(frames)} frames to {args["gif_path"]}')
+
+    print(f'\nEvaluation finished after {tick} ticks')
+    if max_ticks > 0:
+        episode_lengths = np.array([info['episode_length'] for info in infos])
+        print(f'{sum(episode_lengths == max_ticks)}/{len(infos)} environments truncated.')
+
+    eval_weights = [float(w) for w in eval_weights.cpu().numpy()] if eval_weights is not None else None
+
+    if args['save_eval_data']:
+        tag = get_tag_for_experiment(args["eval"], vecenv, policy, eval_weights)
+        tag = tag.lower().replace(" (w/o conditioning)", "_no_cond")   
+        with open(f'eval_{env_name}_{tag}.pkl', 'wb') as f:
+            pickle.dump({
+                "infos": infos,
+                "eval_weights": eval_weights,
+            }, f)
+
+def get_weight_from_schedule(schedule, tick=0, device='cpu'):
+    if schedule is None:
+        return None
+    sorted_ticks = sorted(schedule.keys())
+    weight = None
+    for t in sorted_ticks:
+        if tick >= t:
+            weight = torch.as_tensor(schedule[t], dtype=torch.float32, device=device)
+    return weight
+
+def pi_action_selection(q_values, weights, action_dims=None):
+    if action_dims is not None:
+        q_values_split = torch.split(q_values, action_dims, dim=-1)
+        action_per_dim = []
+        for q in q_values_split:
+            if weights is None:
+                # Single objective case, just take max over Q values
+                actions = torch.argmax(q, dim=-1)
+            else:
+                scalar_q_values = torch.einsum('pbra,r->pba', q, weights)
+                max_over_policies = torch.max(scalar_q_values, dim=0).values
+                actions = torch.argmax(max_over_policies, dim=-1)
+            action_per_dim.append(actions)
+        actions = torch.stack(action_per_dim, dim=-1)
+    else:
+        if weights is None:
+            # Single objective case, just take max over Q values
+            actions = torch.argmax(q_values, dim=-1)
+        else:
+            scalar_q_values = torch.einsum('pbra,r->pba', q_values, weights)
+            max_over_policies = torch.max(scalar_q_values, dim=0).values
+            actions = torch.argmax(max_over_policies, dim=-1)
+    return actions
 
 def stop_if_loss_nan(logs):
     return any("losses/" in k and np.isnan(v) for k, v in logs.items())
@@ -1203,6 +1561,15 @@ def load_policy(args, vecenv, env_name=''):
 
         state_dict = torch.load(path, map_location=device)
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+       
+        # Normalize value module naming if needed
+        policy_uses_value_fn = "policy.value_fn" in dict(policy.named_modules())
+        state_uses_value_fn  = any(k.startswith("policy.value_fn.") for k in state_dict)
+
+        if policy_uses_value_fn != state_uses_value_fn:
+            old, new = ("value", "value_fn") if policy_uses_value_fn else ("value_fn", "value")
+            state_dict = {k.replace(old, new): v for k, v in state_dict.items()}
+
         policy.load_state_dict(state_dict)
 
     load_path = args['load_model_path']
@@ -1252,6 +1619,17 @@ def load_config_file(file_path, fill_in_default=True, parser=None):
 
     return process_config(p, parser=parser)
 
+def str_to_bool(v):
+    '''Convert string to boolean for argparse'''
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
 def make_parser():
     '''Creates the argument parser with default PufferLib arguments.'''
     parser = argparse.ArgumentParser(formatter_class=RichHelpFormatter, add_help=False)
@@ -1274,6 +1652,11 @@ def make_parser():
     parser.add_argument('--no-model-upload', action='store_true', help='Do not upload models to wandb or neptune')
     parser.add_argument('--local-rank', type=int, default=0, help='Used by torchrun for DDP')
     parser.add_argument('--tag', type=str, default=None, help='Tag for experiment')
+    parser.add_argument('--max-steps', type=int, default=1000, help='Max number of steps for evaluation')    
+    parser.add_argument('--stop-accumulating-after-done', action='store_true', help='Stop accumulating rewards after done during evaluation')
+    parser.add_argument('--eval-weights', type=str, default=None, help='Weights for evaluation')
+    parser.add_argument('--save-eval-data', action='store_true', help='Save returns to npz after evaluation')
+    parser.add_argument('--skip-render', action='store_true', help='Skip rendering during evaluation')
     return parser
 
 def process_config(config, parser=None):
@@ -1297,10 +1680,11 @@ def process_config(config, parser=None):
                 value = config[section][key]
 
             fmt = f'--{key}' if section == 'base' else f'--{section}.{key}'
+            arg_type = auto_type if value == 'auto' else (str_to_bool if isinstance(value, bool) else type(value))
             parser.add_argument(
                 fmt.replace('_', '-'),
                 default=value,
-                type=auto_type if value == 'auto' else type(value)
+                type=arg_type
             )
 
     parser.add_argument('-h', '--help', default=argparse.SUPPRESS,

@@ -1,3 +1,36 @@
+
+> **⚠️ Fork notice**: This is a fork of [PufferLib](https://github.com/PufferAI/PufferLib/tree/3.0)
+> with algorithmic and environment extensions for multi-objective reinforcement learning (MORL).
+> This work is part of the paper "Controllability in preference-conditioned multi-objective reinforcement learning", currently under review at NeuS 2026.
+
+## Key differences from PufferLib
+
+### Algorithmic extensions
+
+- **Weight Conditioning**: Policy networks conditioned on preference weights via Dirichlet sampling
+- **Multi-Objective PPO (MOPPO)**: Extended PPO to handle vector rewards with preference weight conditioning
+
+### Environment extensions
+
+- **Multi-objective environment variants**: `snake_mo`, `moba_mo`, `tetris_mo` with vectorized rewards
+- **Reward decomposition**: Separate reward components (e.g., food/corpse/death in Snake, death/xp/distance/tower in MOBA)
+
+### Experiments
+
+Experiments on dynamic adaptation were performed using the default evaluation command in PufferLib on `tetris_mo` while recording the virtual environment screen using script `./record.sh`, e.g.:
+
+```bash
+./record.sh tetris.mp4 puffer eval puffer_tetris_mo --wandb --load-id <wandb-load-id>  # for MOPPO
+```
+
+Experiments on static adaptation were run on three environments
+comparing non-conditioned baselines (PPO, MOPPO without conditioning)
+against the weight-conditioned MOPPO.
+Evaluation used 30 randomly sampled preference vectors per each of the two best models per environment and algorithm.
+See [run_adaptation_experiment.py](run_adaptation_experiment.py) for details.
+
+---
+
 ![figure](https://pufferai.github.io/source/resource/header.png)
 
 [![PyPI version](https://badge.fury.io/py/pufferlib.svg)](https://badge.fury.io/py/pufferlib)

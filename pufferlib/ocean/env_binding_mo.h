@@ -1,6 +1,9 @@
 #include <Python.h>
 #include <numpy/arrayobject.h>
 
+#include <gsl/gsl_rng.h>
+#include <gsl/gsl_randist.h>
+
 // Forward declarations for env-specific functions supplied by user
 static int my_log(PyObject* dict, Log* log);
 static int my_init(Env* env, PyObject* args, PyObject* kwargs);
@@ -49,8 +52,8 @@ static Env* unpack_env(PyObject* args) {
 
 // Python function to initialize the environment
 static PyObject* env_init(PyObject* self, PyObject* args, PyObject* kwargs) {
-    if (PyTuple_Size(args) != 6) {
-        PyErr_SetString(PyExc_TypeError, "Environment requires 5 arguments");
+    if (PyTuple_Size(args) != 7) {
+        PyErr_SetString(PyExc_TypeError, "Environment requires 6 arguments");
         return NULL;
     }
 
@@ -98,13 +101,29 @@ static PyObject* env_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         PyErr_SetString(PyExc_ValueError, "Rewards must be contiguous");
         return NULL;
     }
-    if (PyArray_NDIM(rewards) != 1) {
-        PyErr_SetString(PyExc_ValueError, "Rewards must be 1D");
+    if (PyArray_NDIM(rewards) != 2) {
+        PyErr_SetString(PyExc_ValueError, "Rewards must be 2D");
         return NULL;
     }
     env->rewards = PyArray_DATA(rewards);
 
-    PyObject* term = PyTuple_GetItem(args, 3);
+    PyObject* wgt = PyTuple_GetItem(args, 3);
+    if (!PyObject_TypeCheck(wgt, &PyArray_Type)) {
+        PyErr_SetString(PyExc_TypeError, "Weights must be a NumPy array");
+        return NULL;
+    }
+    PyArrayObject* weights = (PyArrayObject*)wgt;
+    if (!PyArray_ISCONTIGUOUS(weights)) {
+        PyErr_SetString(PyExc_ValueError, "Weights must be contiguous");
+        return NULL;
+    }
+    if (PyArray_NDIM(weights) != 2) {
+        PyErr_SetString(PyExc_ValueError, "Weights must be 2D");
+        return NULL;
+    }
+    env->weights = PyArray_DATA(weights);
+
+    PyObject* term = PyTuple_GetItem(args, 4);
     if (!PyObject_TypeCheck(term, &PyArray_Type)) {
         PyErr_SetString(PyExc_TypeError, "Terminals must be a NumPy array");
         return NULL;
@@ -120,7 +139,7 @@ static PyObject* env_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     }
     env->terminals = PyArray_DATA(terminals);
 
-    PyObject* trunc = PyTuple_GetItem(args, 4);
+    PyObject* trunc = PyTuple_GetItem(args, 5);
     if (!PyObject_TypeCheck(trunc, &PyArray_Type)) {
         PyErr_SetString(PyExc_TypeError, "Truncations must be a NumPy array");
         return NULL;
@@ -137,7 +156,7 @@ static PyObject* env_init(PyObject* self, PyObject* args, PyObject* kwargs) {
     // env->truncations = PyArray_DATA(truncations);
     
     
-    PyObject* seed_arg = PyTuple_GetItem(args, 5);
+    PyObject* seed_arg = PyTuple_GetItem(args, 6);
     if (!PyObject_TypeCheck(seed_arg, &PyLong_Type)) {
         PyErr_SetString(PyExc_TypeError, "seed must be an integer");
         return NULL;
@@ -146,6 +165,10 @@ static PyObject* env_init(PyObject* self, PyObject* args, PyObject* kwargs) {
  
     // Assumes each process has the same number of environments
     srand(seed);
+
+    // Set GSL seed
+    env->gsl_rng = gsl_rng_alloc(gsl_rng_default);
+    gsl_rng_set(env->gsl_rng, seed);
 
     #ifdef USE_GAMMA
     env->gamma = unpack(kwargs, "gamma");
@@ -291,8 +314,8 @@ static VecEnv* unpack_vecenv(PyObject* args) {
 }
 
 static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
-    if (PyTuple_Size(args) != 7) {
-        PyErr_SetString(PyExc_TypeError, "vec_init requires 6 arguments");
+    if (PyTuple_Size(args) != 8) {
+        PyErr_SetString(PyExc_TypeError, "vec_init requires 7 arguments");
         return NULL;
     }
 
@@ -301,7 +324,7 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         PyErr_SetString(PyExc_MemoryError, "Failed to allocate vec env");
         return NULL;
     }
-    PyObject* num_envs_arg = PyTuple_GetItem(args, 5);
+    PyObject* num_envs_arg = PyTuple_GetItem(args, 6);
     if (!PyObject_TypeCheck(num_envs_arg, &PyLong_Type)) {
         PyErr_SetString(PyExc_TypeError, "num_envs must be an integer");
         return NULL;
@@ -318,7 +341,7 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         return NULL;
     }
 
-    PyObject* seed_obj = PyTuple_GetItem(args, 6);
+    PyObject* seed_obj = PyTuple_GetItem(args, 7);
     if (!PyObject_TypeCheck(seed_obj, &PyLong_Type)) {
         PyErr_SetString(PyExc_TypeError, "seed must be an integer");
         return NULL;
@@ -365,12 +388,27 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         PyErr_SetString(PyExc_ValueError, "Rewards must be contiguous");
         return NULL;
     }
-    if (PyArray_NDIM(rewards) != 1) {
-        PyErr_SetString(PyExc_ValueError, "Rewards must be 1D");
+    if (PyArray_NDIM(rewards) != 2) {
+        PyErr_SetString(PyExc_ValueError, "Rewards must be 2D");
         return NULL;
     }
 
-    PyObject* term = PyTuple_GetItem(args, 3);
+    PyObject* wgt = PyTuple_GetItem(args, 3);
+    if (!PyObject_TypeCheck(wgt, &PyArray_Type)) {
+        PyErr_SetString(PyExc_TypeError, "Weights must be a NumPy array");
+        return NULL;
+    }
+    PyArrayObject* weights = (PyArrayObject*)wgt;
+    if (!PyArray_ISCONTIGUOUS(weights)) {
+        PyErr_SetString(PyExc_ValueError, "Weights must be contiguous");
+        return NULL;
+    }
+    if (PyArray_NDIM(weights) != 2) {
+        PyErr_SetString(PyExc_ValueError, "Weights must be 2D");
+        return NULL;
+    }
+
+    PyObject* term = PyTuple_GetItem(args, 4);
     if (!PyObject_TypeCheck(term, &PyArray_Type)) {
         PyErr_SetString(PyExc_TypeError, "Terminals must be a NumPy array");
         return NULL;
@@ -385,7 +423,7 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         return NULL;
     }
 
-    PyObject* trunc = PyTuple_GetItem(args, 4);
+    PyObject* trunc = PyTuple_GetItem(args, 5);
     if (!PyObject_TypeCheck(trunc, &PyArray_Type)) {
         PyErr_SetString(PyExc_TypeError, "Truncations must be a NumPy array");
         return NULL;
@@ -422,12 +460,17 @@ static PyObject* vec_init(PyObject* self, PyObject* args, PyObject* kwargs) {
         env->observations = (void*)((char*)PyArray_DATA(observations) + i*PyArray_STRIDE(observations, 0));
         env->actions = (void*)((char*)PyArray_DATA(actions) + i*PyArray_STRIDE(actions, 0));
         env->rewards = (void*)((char*)PyArray_DATA(rewards) + i*PyArray_STRIDE(rewards, 0));
+        env->weights = (void*)((char*)PyArray_DATA(weights) + i*PyArray_STRIDE(weights, 0));
         env->terminals = (void*)((char*)PyArray_DATA(terminals) + i*PyArray_STRIDE(terminals, 0));
         // env->truncations = (void*)((char*)PyArray_DATA(truncations) + i*PyArray_STRIDE(truncations, 0));
 
         // Assumes each process has the same number of environments
         int env_seed = i + seed*vec->num_envs;
         srand(env_seed);
+
+        // Set GSL seed for this environment
+        env->gsl_rng = gsl_rng_alloc(gsl_rng_default);
+        gsl_rng_set(env->gsl_rng, env_seed);
  
         #ifdef USE_GAMMA
         env->gamma = unpack(kwargs, "gamma");
@@ -508,8 +551,16 @@ static PyObject* vec_reset(PyObject* self, PyObject* args) {
  
     for (int i = 0; i < vec->num_envs; i++) {
         // Assumes each process has the same number of environments
-        srand(i + seed*vec->num_envs);
-        c_reset(vec->envs[i]);
+        int env_seed = i + seed*vec->num_envs;
+        srand(env_seed);
+
+        Env* env = vec->envs[i];
+        
+        // Set GSL seed for this environment
+        env->gsl_rng = gsl_rng_alloc(gsl_rng_default);
+        gsl_rng_set(env->gsl_rng, env_seed);
+
+        c_reset(env);
     }
     Py_RETURN_NONE;
 }
@@ -641,6 +692,29 @@ static PyObject* vec_log_single(PyObject* self, PyObject* args) {
     return dict;
 }
 
+static PyObject* vec_put(PyObject* self, PyObject* args, PyObject* kwargs) {
+    int num_args = PyTuple_Size(args);
+    if (num_args != 1) {
+        PyErr_SetString(PyExc_TypeError, "vec_put requires 1 positional argument");
+        return NULL;
+    }
+
+    VecEnv* vec = unpack_vecenv(args);
+    if (!vec) {
+        return NULL;
+    }
+
+    PyObject* empty_args = PyTuple_New(0);
+    for (int i = 0; i < vec->num_envs; i++) {
+        my_put(vec->envs[i], empty_args, kwargs);
+        if (PyErr_Occurred()) {
+            return NULL;
+        }
+    }
+
+    Py_RETURN_NONE;
+}
+
 static PyObject* vec_close(PyObject* self, PyObject* args) {
     VecEnv* vec = unpack_vecenv(args);
     if (!vec) {
@@ -700,6 +774,7 @@ static PyMethodDef methods[] = {
     {"vec_log", vec_log, METH_VARARGS, "Log the vector of environments"},
     {"vec_log_single", vec_log_single, METH_VARARGS, "Log a single environment in the vector"},
     {"vec_render", vec_render, METH_VARARGS, "Render the vector of environments"},
+    {"vec_put", (PyCFunction)vec_put, METH_VARARGS | METH_KEYWORDS, "Put stuff into vec env"},
     {"vec_close", vec_close, METH_VARARGS, "Close the vector of environments"},
     {"shared", (PyCFunction)my_shared, METH_VARARGS | METH_KEYWORDS, "Shared state"},
     MY_METHODS,

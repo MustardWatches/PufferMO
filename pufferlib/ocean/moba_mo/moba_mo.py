@@ -6,12 +6,12 @@ import pettingzoo
 import gymnasium
 
 import pufferlib
-from pufferlib.ocean.moba import binding
+from pufferlib.ocean.moba_mo import binding
 
 MAP_OBS_N = 11*11*4
-PLAYER_OBS_N = 26
+PLAYER_OBS_N = 25
 
-class Moba(pufferlib.PufferEnv):
+class MobaMO(pufferlib.PufferEnv):
     def __init__(self, num_envs=4, vision_range=5, agent_speed=1.0,
             discretize=True, reward_death=-1.0, reward_xp=0.006,
             reward_distance=0.05, reward_tower=3.0, report_interval=32,
@@ -24,12 +24,15 @@ class Moba(pufferlib.PufferEnv):
         self.render_mode = render_mode
         self.players = players = 5 if script_opponents else 10
         self.num_agents = players*num_envs
+        self.reward_dim = 3
 
         self.single_observation_space = gymnasium.spaces.Box(low=0, high=255,
             shape=(MAP_OBS_N + PLAYER_OBS_N,), dtype=np.uint8)
         self.single_action_space = gymnasium.spaces.MultiDiscrete([7, 7, 3, 2, 2, 2])
+        self.single_reward_space = gymnasium.spaces.Box(low=-1, high=1,
+            shape=(self.reward_dim,), dtype=np.float32)
 
-        super().__init__(buf=buf)
+        super().__init__(buf=buf, multiobjective_reward=True)
 
         c_envs = []
         self.c_state = binding.shared()
@@ -37,7 +40,8 @@ class Moba(pufferlib.PufferEnv):
             env_id = binding.env_init(
                 self.observations[i*players:(i+1)*players],
                 self.actions[i*players:(i+1)*players],
-                self.rewards[i*players:(i+1)*players],
+                self.rewards[i*players:(i+1)*players,:],
+                self.weights[i*players:(i+1)*players,:],
                 self.terminals[i*players:(i+1)*players],
                 self.truncations[i*players:(i+1)*players],
                 i + seed*num_envs,
@@ -90,7 +94,7 @@ class Moba(pufferlib.PufferEnv):
             if log:
                 infos.append(log)
 
-        return (self.observations, self.rewards,
+        return (self.observations, self.rewards, self.weights,
             self.terminals, self.truncations, infos)
 
     def render(self):
@@ -99,6 +103,9 @@ class Moba(pufferlib.PufferEnv):
 
     def close(self):
         binding.vec_close(self.c_envs)
+
+    def set_weights(self, weights):
+        binding.vec_put(self.c_envs, weights=weights)
 
 
 def test_performance(timeout=20, atn_cache=1024, num_envs=400):

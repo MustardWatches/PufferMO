@@ -189,11 +189,15 @@ class Terraform(nn.Module):
         value = self.value(hidden)
         return action, value
 
-
 class Snake(nn.Module):
-    def __init__(self, env, cnn_channels=32, hidden_size=128):
+    def __init__(self, env, cnn_channels=32, hidden_size=128, q_value_critic=False, weight_conditioning=False):
         super().__init__()
         self.hidden_size = hidden_size
+        self.multiobjective_reward = hasattr(env, 'reward_dim')
+        self.weight_conditioning = weight_conditioning
+        self.q_value_critic = q_value_critic
+        self.reward_dim = env.reward_dim if self.multiobjective_reward else 1
+
         self.is_continuous = False
 
         encode_dim = cnn_channels
@@ -214,18 +218,28 @@ class Snake(nn.Module):
         )
  
         '''
+        input_size = 8*np.prod(env.single_observation_space.shape)
+        input_size += self.reward_dim if self.weight_conditioning else 0
         self.encoder= torch.nn.Sequential(
-            nn.Linear(8*np.prod(env.single_observation_space.shape), hidden_size),
+            nn.Linear(input_size, hidden_size),
             nn.GELU(),
         )
+
+        self.num_atns = env.single_action_space.n
         self.decoder = pufferlib.pytorch.layer_init(
-            nn.Linear(hidden_size, env.single_action_space.n), std=0.01)
+            nn.Linear(hidden_size, self.num_atns), std=0.01)
+
+        if self.q_value_critic:
+            value_fn_output_size = self.reward_dim * self.num_atns
+        else:
+            value_fn_output_size = self.reward_dim
+
         self.value = pufferlib.pytorch.layer_init(
-            nn.Linear(hidden_size, 1), std=1)
+            nn.Linear(hidden_size, value_fn_output_size), std=1)
 
     def forward(self, observations, state=None):
         #observations = F.one_hot(observations.long(), 8).permute(0, 3, 1, 2).float()
-        hidden = self.encode_observations(observations)
+        hidden = self.encode_observations(observations, state)
         actions, value = self.decode_actions(hidden)
         return actions, value
 
@@ -234,22 +248,19 @@ class Snake(nn.Module):
 
     def encode_observations(self, observations, state=None):
         observations = F.one_hot(observations.long(), 8).view(-1, 11*11*8).float()
+        if self.weight_conditioning and state is not None and 'weight' in state:
+            weight_features = state['weight'].float()
+            observations = torch.cat([observations, weight_features], dim=1)
         return self.encoder(observations)
 
     def decode_actions(self, hidden):
         action = self.decoder(hidden)
         value = self.value(hidden)
+        if self.q_value_critic and self.multiobjective_reward:
+            value = value.view(-1, self.reward_dim, self.num_atns)
+        elif self.q_value_critic:
+            value = value.view(-1, self.num_atns)
         return action, value
-
-'''
-class Snake(pufferlib.models.Default):
-    def __init__(self, env, hidden_size=128):
-        super().__init__()
-
-    def encode_observations(self, observations, state=None):
-        observations = F.one_hot(observations.long(), 8).view(-1, 11*11*8).float()
-        super().encode_observations(observations, state)
-'''
 
 class Grid(nn.Module):
     def __init__(self, env, cnn_channels=32, hidden_size=128, **kwargs):
@@ -373,9 +384,14 @@ class Go(nn.Module):
         return action, value
     
 class MOBA(nn.Module):
-    def __init__(self, env, cnn_channels=128, hidden_size=128, **kwargs):
+    def __init__(self, env, cnn_channels=128, hidden_size=128, q_value_critic=False, weight_conditioning=False, num_features_1d=25, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
+        self.multiobjective_reward = hasattr(env, 'reward_dim')
+        self.weight_conditioning = weight_conditioning
+        self.q_value_critic = q_value_critic
+        self.reward_dim = env.reward_dim if self.multiobjective_reward else 1
+        
         self.cnn = nn.Sequential(
             pufferlib.pytorch.layer_init(
                 nn.Conv2d(16 + 3, cnn_channels, 5, stride=3)),
@@ -384,8 +400,11 @@ class MOBA(nn.Module):
                 nn.Conv2d(cnn_channels, cnn_channels, 3, stride=1)),
             nn.Flatten(),
         )
-        self.flat = pufferlib.pytorch.layer_init(nn.Linear(26, 128))
-        self.proj = pufferlib.pytorch.layer_init(nn.Linear(128+cnn_channels, hidden_size))
+        self.num_features_1d = num_features_1d
+        self.flat = pufferlib.pytorch.layer_init(nn.Linear(self.num_features_1d, 128))
+        proj_input_size = 128 + cnn_channels
+        proj_input_size += self.reward_dim if self.weight_conditioning else 0
+        self.proj = pufferlib.pytorch.layer_init(nn.Linear(proj_input_size, hidden_size))
 
         self.is_continuous = isinstance(env.single_action_space, pufferlib.spaces.Box)
         if self.is_continuous:
@@ -395,14 +414,21 @@ class MOBA(nn.Module):
                 1, env.single_action_space.shape[0]))
         else:
             self.atn_dim = env.single_action_space.nvec.tolist()
+            self.num_atns = sum(self.atn_dim)
             self.actor = pufferlib.pytorch.layer_init(
-                nn.Linear(hidden_size, sum(self.atn_dim)), std=0.01)
+                nn.Linear(hidden_size, self.num_atns), std=0.01)
+
+        if self.q_value_critic:
+            assert not self.is_continuous, "Q value critic does not currently support continuous actions"
+            value_fn_output_size = self.reward_dim * self.num_atns
+        else:
+            value_fn_output_size = self.reward_dim
 
         self.value_fn = pufferlib.pytorch.layer_init(
-            nn.Linear(hidden_size, 1), std=1)
+            nn.Linear(hidden_size, value_fn_output_size), std=1)
 
     def forward(self, observations, state=None):
-        hidden = self.encode_observations(observations)
+        hidden = self.encode_observations(observations, state)
         actions, value = self.decode_actions(hidden)
         return actions, value
 
@@ -410,7 +436,7 @@ class MOBA(nn.Module):
         return self.forward(x, state)
 
     def encode_observations(self, observations, state=None):
-        cnn_features = observations[:, :-26].view(-1, 11, 11, 4).long()
+        cnn_features = observations[:, :-self.num_features_1d].view(-1, 11, 11, 4).long()
         map_features = F.one_hot(cnn_features[:, :, :, 0], 16).permute(0, 3, 1, 2).float()
         extra_map_features = (cnn_features[:, :, :, -3:].float() / 255).permute(0, 3, 1, 2)
         cnn_features = torch.cat([map_features, extra_map_features], dim=1)
@@ -418,12 +444,20 @@ class MOBA(nn.Module):
         cnn_features = self.cnn(cnn_features)
         #print('cnn features: ', cnn_features[0].detach().cpu().numpy().tolist())
 
-        flat_features = observations[:, -26:].float() / 255.0
+        flat_features = observations[:, -self.num_features_1d:].float() / 255.0
         #print('observations 1d: ', flat_features[0, 0])
         flat_features = self.flat(flat_features)
         #print('flat features: ', flat_features[0].detach().cpu().numpy().tolist())
 
-        features = torch.cat([cnn_features, flat_features], dim=1)
+        # Concatenate weight vector if using vector rewards
+        if self.weight_conditioning and state is not None and 'weight' in state:
+            weight_features = state['weight'].float()
+            if weight_features.dim() == 1:
+                weight_features = weight_features.unsqueeze(0).expand(cnn_features.shape[0], -1)
+            features = torch.cat([cnn_features, flat_features, weight_features], dim=1)
+        else:
+            features = torch.cat([cnn_features, flat_features], dim=1)
+            
         features = F.relu(self.proj(F.relu(features)))
         #print('features: ', features[0].detach().cpu().numpy().tolist())
         return features
@@ -431,6 +465,11 @@ class MOBA(nn.Module):
     def decode_actions(self, flat_hidden):
         #print('lstm: ', flat_hidden[0].detach().cpu().numpy().tolist())
         value = self.value_fn(flat_hidden)
+        if self.q_value_critic and self.multiobjective_reward:
+            value = value.view(-1, self.reward_dim, self.num_atns)
+        elif self.q_value_critic:
+            value = value.view(-1, self.num_atns)
+
         if self.is_continuous:
             mean = self.decoder_mean(flat_hidden)
             logstd = self.decoder_logstd.expand_as(mean)

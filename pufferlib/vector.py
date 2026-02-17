@@ -16,8 +16,9 @@ STEP = 1
 SEND = 2
 RECV = 3
 CLOSE = 4
-MAIN = 5
-INFO = 6
+SET_WEIGHTS = 5
+MAIN = 6
+INFO = 7
 
 def recv_precheck(vecenv):
     if vecenv.flag != RECV:
@@ -38,16 +39,34 @@ def send_precheck(vecenv, actions):
     vecenv.flag = RECV
     return actions
 
+def set_weights_precheck(vecenv, weights):
+    if not hasattr(vecenv.driver_env, 'set_weights'):
+        raise pufferlib.APIUsageError(f'Environment {type(vecenv.driver_env).__name__} does not have set_weights method')
+    
+    if vecenv.flag == SEND:
+        raise pufferlib.APIUsageError('Cannot set weights between send and recv calls')
+
+    weights = np.asarray(weights, dtype=np.float32)
+
+    return weights
+
 def reset(vecenv, seed=42):
     vecenv.async_reset(seed)
-    obs, rewards, terminals, truncations, infos, env_ids, masks = vecenv.recv()
+    if hasattr(vecenv.driver_env, "reward_dim"):
+        obs, rewards, weights, terminals, truncations, infos, env_ids, masks = vecenv.recv()
+    else:
+        obs, rewards, terminals, truncations, infos, env_ids, masks = vecenv.recv()
     return obs, infos
 
 def step(vecenv, actions):
     actions = np.asarray(actions)
     vecenv.send(actions)
-    obs, rewards, terminals, truncations, infos, env_ids, masks = vecenv.recv()
-    return obs, rewards, terminals, truncations, infos # include env_ids or no?
+    if hasattr(vecenv.driver_env, "reward_dim"):
+        obs, rewards, weights, terminals, truncations, infos, env_ids, masks = vecenv.recv()
+        return obs, rewards, weights, terminals, truncations, infos
+    else:
+        obs, rewards, terminals, truncations, infos, env_ids, masks = vecenv.recv()
+        return obs, rewards, terminals, truncations, infos # include env_ids or no?
 
 class Serial:
     reset = reset
@@ -67,8 +86,14 @@ class Serial:
         self.action_space = pufferlib.spaces.joint_space(self.single_action_space, self.agents_per_batch)
         self.observation_space = pufferlib.spaces.joint_space(self.single_observation_space, self.agents_per_batch)
 
+        self.multiobjective_reward = hasattr(self.driver_env, "reward_dim")
+        if self.multiobjective_reward:
+            self.reward_dim = self.driver_env.reward_dim
+            self.recv = self.recv_mo
+        else:
+            self.recv = self.recv_so
 
-        set_buffers(self, buf)
+        set_buffers(self, buf, self.multiobjective_reward)
 
         self.envs = []
         ptr = 0
@@ -82,6 +107,8 @@ class Serial:
                 masks=self.masks[ptr:end],
                 actions=self.actions[ptr:end]
             )
+            if self.multiobjective_reward:
+                buf_i['weights'] = self.weights[ptr:end]
             ptr = end
             seed_i = seed + i if seed is not None else None
             env = env_creators[i](*env_args[i], buf=buf_i, seed=seed_i, **env_kwargs[i])
@@ -144,7 +171,10 @@ class Serial:
             if env.done:
                 o, i = env.reset()
             else:
-                o, r, d, t, i = env.step(atns)
+                if self.multiobjective_reward:
+                    o, r, w, d, t, i = env.step(atns)
+                else:
+                    o, r, d, t, i = env.step(atns)
 
             if i:
                 if isinstance(i, list):
@@ -160,16 +190,26 @@ class Serial:
         for env in self.envs:
             env.notify()
 
-    def recv(self):
+    def recv_so(self):
         recv_precheck(self)
         return (self.observations, self.rewards, self.terminals, self.truncations,
             self.infos, self.agent_ids, self.masks)
+
+    def recv_mo(self):
+        recv_precheck(self)
+        return (self.observations, self.rewards, self.weights, self.terminals, self.truncations,
+            self.infos, self.agent_ids, self.masks)            
+
+    def set_weights(self, weights):
+        weights = set_weights_precheck(self, weights)
+        for env in self.envs:
+            env.set_weights(weights)
 
     def close(self):
         for env in self.envs:
             env.close()
 
-def _worker_process(env_creators, env_args, env_kwargs, obs_shape, obs_dtype, atn_shape, atn_dtype,
+def _worker_process(env_creators, env_args, env_kwargs, obs_shape, obs_dtype, atn_shape, atn_dtype, rew_shape,
         num_envs, num_agents, num_workers, worker_idx, send_pipe, recv_pipe, shm, is_native, seed):
 
     # Environments read and write directly to shared memory
@@ -179,12 +219,18 @@ def _worker_process(env_creators, env_args, env_kwargs, obs_shape, obs_dtype, at
     buf = dict(
         observations=np.ndarray((*shape, *obs_shape),
             dtype=obs_dtype, buffer=shm['observations'])[worker_idx],
-        rewards=np.ndarray(shape, dtype=np.float32, buffer=shm['rewards'])[worker_idx],
+        rewards=np.ndarray(rew_shape, dtype=np.float32, buffer=shm["rewards"])[worker_idx],
         terminals=np.ndarray(shape, dtype=bool, buffer=shm['terminals'])[worker_idx],
         truncations=np.ndarray(shape, dtype=bool, buffer=shm['truncateds'])[worker_idx],
         masks=np.ndarray(shape, dtype=bool, buffer=shm['masks'])[worker_idx],
         actions=atn_arr,
     )
+    # Reward is multiobjective if shape is 3D (num_workers, num_agents, reward_dim)
+    multiobjective_reward = len(rew_shape) == 3
+
+    if multiobjective_reward:
+        buf['weights'] = np.ndarray(rew_shape, dtype=np.float32, buffer=shm["weights"])[worker_idx]
+        manual_weights = np.ndarray((rew_shape[-1],), dtype=np.float32, buffer=shm["manual_weights"])
     buf['masks'][:] = True
 
     if is_native and num_envs == 1:
@@ -211,7 +257,13 @@ def _worker_process(env_creators, env_args, env_kwargs, obs_shape, obs_dtype, at
             seed = recv_pipe.recv()
             _, infos = envs.reset(seed=seed)
         elif sem == STEP:
-            _, _, _, _, infos = envs.step(atn_arr)
+            if multiobjective_reward:
+                _, _, _, _, _, infos = envs.step(atn_arr)
+            else:
+                _, _, _, _, infos = envs.step(atn_arr)
+        elif sem == SET_WEIGHTS:
+            envs.set_weights(manual_weights)
+            infos = None
         elif sem == CLOSE:
             envs.close()
             send_pipe.send(None)
@@ -294,34 +346,49 @@ class Multiprocessing:
         self.observation_space = pufferlib.spaces.joint_space(self.single_observation_space, self.agents_per_batch)
         self.agent_ids = np.arange(num_agents).reshape(num_workers, agents_per_worker)
 
+        self.multiobjective_reward = hasattr(driver_env, "reward_dim")
+        reward_dim = driver_env.reward_dim if self.multiobjective_reward else 1
+        if self.multiobjective_reward:
+            self.reward_dim = reward_dim
+
         from multiprocessing import RawArray, set_start_method
         # Mac breaks without setting fork... but setting it breaks sweeps on 2nd run
         #set_start_method('fork')
         self.shm = dict(
             observations=RawArray(obs_ctype, num_agents * int(np.prod(obs_shape))),
             actions=RawArray(atn_ctype, num_agents * int(np.prod(atn_shape))),
-            rewards=RawArray('f', num_agents),
+            rewards=RawArray('f', num_agents * reward_dim),
             terminals=RawArray('b', num_agents),
             truncateds=RawArray('b', num_agents),
             masks=RawArray('b', num_agents),
             semaphores=RawArray('c', num_workers),
             notify=RawArray('b', num_workers),
         )
+        if self.multiobjective_reward:
+            self.shm['weights'] = RawArray("f", num_agents * reward_dim)
+            self.shm['manual_weights'] = RawArray("f", reward_dim)
         shape = (num_workers, agents_per_worker)
+        rew_shape = (*shape, reward_dim) if self.multiobjective_reward else shape
+        self.rew_batch_shape = (self.agents_per_batch, reward_dim)
         self.obs_batch_shape = (self.agents_per_batch, *obs_shape)
         self.atn_batch_shape = (self.workers_per_batch, agents_per_worker, *atn_shape)
         self.actions = np.ndarray((*shape, *atn_shape),
             dtype=atn_dtype, buffer=self.shm['actions'])
+        if self.multiobjective_reward:
+            self.manual_weights = np.ndarray((reward_dim,),
+                dtype=np.ctypeslib.as_ctypes_type(np.float32), buffer=self.shm['manual_weights'])
         self.buf = dict(
             observations=np.ndarray((*shape, *obs_shape),
                 dtype=obs_dtype, buffer=self.shm['observations']),
-            rewards=np.ndarray(shape, dtype=np.float32, buffer=self.shm['rewards']),
+            rewards=np.ndarray(rew_shape, dtype=np.float32, buffer=self.shm['rewards']),
             terminals=np.ndarray(shape, dtype=bool, buffer=self.shm['terminals']),
             truncations=np.ndarray(shape, dtype=bool, buffer=self.shm['truncateds']),
             masks=np.ndarray(shape, dtype=bool, buffer=self.shm['masks']),
             semaphores=np.ndarray(num_workers, dtype=np.uint8, buffer=self.shm['semaphores']),
             notify=np.ndarray(num_workers, dtype=bool, buffer=self.shm['notify']),
         )
+        if self.multiobjective_reward:
+            self.buf['weights'] = np.ndarray(rew_shape, dtype=np.float32, buffer=self.shm['weights'])
         self.buf['semaphores'][:] = MAIN 
 
         from multiprocessing import Pipe, Process
@@ -338,7 +405,7 @@ class Multiprocessing:
                 target=_worker_process,
                 args=(env_creators[start:end], env_args[start:end],
                     env_kwargs[start:end], obs_shape, obs_dtype,
-                    atn_shape, atn_dtype, envs_per_worker, driver_env.num_agents,
+                    atn_shape, atn_dtype, rew_shape, envs_per_worker, driver_env.num_agents,
                     num_workers, i, w_send_pipes[i], w_recv_pipes[i],
                     self.shm, is_native, seed_i)
             )
@@ -428,7 +495,12 @@ class Multiprocessing:
         buf = self.buf
 
         o = buf['observations'][w_slice].reshape(self.obs_batch_shape)
-        r = buf['rewards'][w_slice].ravel()
+        if self.multiobjective_reward:
+            r = buf['rewards'][w_slice].reshape(self.rew_batch_shape)
+            # r = r.sum(axis=1)  # TODO PHM: This is for testing only, remove for MOPPO
+            w = buf['weights'][w_slice].reshape(self.rew_batch_shape)
+        else:
+            r = buf['rewards'][w_slice].ravel()
         d = buf['terminals'][w_slice].ravel()
         t = buf['truncations'][w_slice].ravel()
 
@@ -442,7 +514,10 @@ class Multiprocessing:
         m = buf['masks'][w_slice].ravel()
         self.batch_mask = m
 
-        return o, r, d, t, infos, agent_ids, m
+        if self.multiobjective_reward:
+            return o, r, w, d, t, infos, agent_ids, m
+        else:
+            return o, r, d, t, infos, agent_ids, m
 
     def send(self, actions):
         actions = send_precheck(self, actions).reshape(self.atn_batch_shape)
@@ -482,6 +557,34 @@ class Multiprocessing:
     def notify(self):
         self.buf['notify'][:] = True
 
+    def set_weights(self, weights):
+        weights = set_weights_precheck(self, weights)
+        
+        # Flush any waiting workers first
+        while self.waiting_workers:
+            worker = self.waiting_workers.pop(0)
+            sem = self.buf['semaphores'][worker]
+            if sem >= MAIN:
+                self.ready_workers.append(worker)
+                if sem == INFO:
+                    self.recv_pipes[worker].recv()
+            else:
+                self.waiting_workers.append(worker)
+                break
+        
+        # Update shared memory and signal workers
+        self.manual_weights[:] = weights
+        self.buf['semaphores'][:] = SET_WEIGHTS
+        
+        # Wait for all workers to complete
+        while not (self.buf['semaphores'] >= MAIN).all():
+            time.sleep(0.001)
+        
+        # Reset worker tracking state
+        self.ready_workers = []
+        self.ready_next_workers = [] # Used to evenly sample workers
+        self.waiting_workers = list(range(self.num_workers))
+
     def close(self):
         self.driver_env.close()
         for p in self.processes:
@@ -517,6 +620,9 @@ class Ray():
         obs_shape = obs_space.shape
         atn_space = driver_env.single_action_space
         atn_shape = atn_space.shape
+
+        if hasattr(driver_env, "reward_dim"):
+            raise pufferlib.APIUsageError("Ray backend does not yet support vector rewards")
 
         shape = (num_workers, agents_per_worker)
         self.obs_batch_shape = (self.agents_per_batch, *obs_shape)
@@ -755,6 +861,8 @@ def autotune(env_creator, batch_size, max_envs=194, model_forward_s=0.0,
     # Initial profile to estimate single-core performance
     print('Profiling single-core performance for ~', time_per_test, 'seconds')
     env = env_creator()
+    if hasattr(env, 'reward_dim'):
+        raise ValueError('autotune does not yet support vector rewards')
     env.reset()
     obs_space = env.single_observation_space
     actions = [

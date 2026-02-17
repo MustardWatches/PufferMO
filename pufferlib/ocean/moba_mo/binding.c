@@ -1,8 +1,9 @@
-#include "moba.h"
+#include "moba_mo.h"
 
-#define Env MOBA
+#define Env MOBA_MO
 #define MY_SHARED
-#include "../env_binding.h"
+#define MY_PUT
+#include "../env_binding_mo.h"
 
 static PyObject* my_shared(PyObject* self, PyObject* args, PyObject* kwargs) {
     unsigned char* game_map_npy = read_file("resources/moba/game_map.npy");
@@ -28,7 +29,6 @@ static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
     env->discretize = unpack(kwargs, "discretize");
     env->reward_death = unpack(kwargs, "reward_death");
     env->reward_xp = unpack(kwargs, "reward_xp");
-    env->reward_distance = unpack(kwargs, "reward_distance");
     env->reward_tower = unpack(kwargs, "reward_tower");
     env->script_opponents = unpack(kwargs, "script_opponents");
     env->max_ticks = unpack(kwargs, "max_ticks");
@@ -122,10 +122,12 @@ static int my_log(PyObject* dict, Log* log) {
     assign_to_dict(dict, "perf", log->perf);
     assign_to_dict(dict, "score", log->score);
     assign_to_dict(dict, "episode_return", log->episode_return);
+    assign_to_dict(dict, "scalarized_episode_return", log->scalarized_episode_return);
     assign_to_dict(dict, "episode_return_death", log->episode_return_death);
     assign_to_dict(dict, "episode_return_xp", log->episode_return_xp);
     assign_to_dict(dict, "episode_return_tower", log->episode_return_tower);
     assign_to_dict(dict, "discounted_episode_return", log->discounted_episode_return);
+    assign_to_dict(dict, "discounted_scalarized_episode_return", log->discounted_scalarized_episode_return);
     assign_to_dict(dict, "discounted_episode_return_death", log->discounted_episode_return_death);
     assign_to_dict(dict, "discounted_episode_return_xp", log->discounted_episode_return_xp);
     assign_to_dict(dict, "discounted_episode_return_tower", log->discounted_episode_return_tower);
@@ -138,10 +140,11 @@ static int my_log(PyObject* dict, Log* log) {
     assign_to_dict(dict, "dire_towers_alive", log->dire_towers_alive);
 
     assign_to_dict(dict, "radiant_support_episode_return", log->radiant_support_episode_return);
+    assign_to_dict(dict, "radiant_support_scalarized_episode_return", log->radiant_support_scalarized_episode_return);
     assign_to_dict(dict, "radiant_support_discounted_episode_return", log->radiant_support_discounted_episode_return);
+    assign_to_dict(dict, "radiant_support_discounted_scalarized_episode_return", log->radiant_support_discounted_scalarized_episode_return);
     assign_to_dict(dict, "radiant_support_reward_death", log->radiant_support_reward_death);
     assign_to_dict(dict, "radiant_support_reward_xp", log->radiant_support_reward_xp);
-    assign_to_dict(dict, "radiant_support_reward_distance", log->radiant_support_reward_distance);
     assign_to_dict(dict, "radiant_support_reward_tower", log->radiant_support_reward_tower);
     assign_to_dict(dict, "radiant_support_level", log->radiant_support_level);
     assign_to_dict(dict, "radiant_support_kills", log->radiant_support_kills);
@@ -157,5 +160,46 @@ static int my_log(PyObject* dict, Log* log) {
     assign_to_dict(dict, "radiant_support_usage_q", log->radiant_support_usage_q);
     assign_to_dict(dict, "radiant_support_usage_w", log->radiant_support_usage_w);
     assign_to_dict(dict, "radiant_support_usage_e", log->radiant_support_usage_e);
+    
+    assign_to_dict(dict, "weight_death", log->weight_death);
+    assign_to_dict(dict, "weight_xp", log->weight_xp);
+    assign_to_dict(dict, "weight_tower", log->weight_tower);
+    return 0;
+}
+
+static int my_put(Env* env, PyObject* args, PyObject* kwargs) {
+    // Check for weights keyword argument
+    PyObject* weights_obj = PyDict_GetItemString(kwargs, "weights");
+    if (weights_obj == NULL) {
+        return 1;
+    }
+
+    if (!PyObject_TypeCheck(weights_obj, &PyArray_Type)) {
+        PyErr_SetString(PyExc_TypeError, "weights must be a NumPy array");
+        return 1;
+    }
+
+    PyArrayObject* weights_array = (PyArrayObject*)weights_obj;
+    if (!PyArray_ISCONTIGUOUS(weights_array)) {
+        PyErr_SetString(PyExc_ValueError, "weights must be contiguous");
+        return 1;
+    }
+    
+    int num_agents = env->script_opponents ? NUM_PLAYERS/2 : NUM_PLAYERS;
+    npy_intp* dims = PyArray_DIMS(weights_array);
+    if (PyArray_NDIM(weights_array) != 1 || dims[0] != REWARD_DIM) {
+        PyErr_SetString(PyExc_ValueError, "weights must be a 1D array with 4 elements");
+        return 1;
+    }
+    
+    // Copy weights to all agents
+    float* weights_data = (float*)PyArray_DATA(weights_array);
+    for (int j = 0; j < num_agents; j++) {
+        for (int i = 0; i < REWARD_DIM; i++) {
+            env->weights[j * REWARD_DIM + i] = weights_data[i];
+        }
+    }
+    env->manual_weights = true;
+    
     return 0;
 }

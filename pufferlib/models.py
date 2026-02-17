@@ -10,7 +10,7 @@ import pufferlib.spaces
 
 
 class Default(nn.Module):
-    '''Default PyTorch policy. Flattens obs and applies a linear layer.
+    '''Default multiobjective PyTorch policy. Flattens obs and applies a linear layer.
 
     PufferLib is not a framework. It does not enforce a base class.
     You can use any PyTorch policy that returns actions and values.
@@ -21,9 +21,14 @@ class Default(nn.Module):
     the recurrent cell into encode_observations and put everything after
     into decode_actions.
     '''
-    def __init__(self, env, hidden_size=128):
+    def __init__(self, env, hidden_size=128, q_value_critic=False, weight_conditioning=False):
         super().__init__()
         self.hidden_size = hidden_size
+        self.multiobjective_reward = hasattr(env, 'reward_dim')
+        self.weight_conditioning = weight_conditioning
+        self.q_value_critic = q_value_critic
+        self.reward_dim = env.reward_dim if self.multiobjective_reward else 1
+
         self.is_multidiscrete = isinstance(env.single_action_space,
                 pufferlib.spaces.MultiDiscrete)
         self.is_continuous = isinstance(env.single_action_space,
@@ -36,9 +41,11 @@ class Default(nn.Module):
         if self.is_dict_obs:
             self.dtype = pufferlib.pytorch.nativize_dtype(env.emulated)
             input_size = int(sum(np.prod(v.shape) for v in env.env.observation_space.values()))
+            input_size += self.reward_dim if self.weight_conditioning else 0
             self.encoder = nn.Linear(input_size, self.hidden_size)
         else:
             num_obs = np.prod(env.single_observation_space.shape)
+            num_obs += self.reward_dim if self.weight_conditioning else 0
             self.encoder = torch.nn.Sequential(
                 pufferlib.pytorch.layer_init(nn.Linear(num_obs, hidden_size)),
                 nn.GELU(),
@@ -46,21 +53,27 @@ class Default(nn.Module):
             
         if self.is_multidiscrete:
             self.action_nvec = tuple(env.single_action_space.nvec)
-            num_atns = sum(self.action_nvec)
+            self.num_atns = sum(self.action_nvec)
             self.decoder = pufferlib.pytorch.layer_init(
-                    nn.Linear(hidden_size, num_atns), std=0.01)
+                    nn.Linear(hidden_size, self.num_atns), std=0.01)
         elif not self.is_continuous:
-            num_atns = env.single_action_space.n
+            self.num_atns = env.single_action_space.n
             self.decoder = pufferlib.pytorch.layer_init(
-                nn.Linear(hidden_size, num_atns), std=0.01)
+                nn.Linear(hidden_size, self.num_atns), std=0.01)
         else:
             self.decoder_mean = pufferlib.pytorch.layer_init(
                 nn.Linear(hidden_size, env.single_action_space.shape[0]), std=0.01)
             self.decoder_logstd = nn.Parameter(torch.zeros(
                 1, env.single_action_space.shape[0]))
 
+        if self.q_value_critic:
+            assert not self.is_continuous, "Q value critic currently does not support continuous actions"
+            value_fn_output_size = self.reward_dim * self.num_atns
+        else:
+            value_fn_output_size = self.reward_dim
+
         self.value = pufferlib.pytorch.layer_init(
-            nn.Linear(hidden_size, 1), std=1)
+            nn.Linear(hidden_size, value_fn_output_size), std=1)
 
     def forward_eval(self, observations, state=None):
         hidden = self.encode_observations(observations, state=state)
@@ -79,6 +92,9 @@ class Default(nn.Module):
             observations = torch.cat([v.view(batch_size, -1) for v in observations.values()], dim=1)
         else: 
             observations = observations.view(batch_size, -1)
+        if self.weight_conditioning:
+            weight_features = state['weight'].float()
+            observations = torch.cat([observations, weight_features], dim=1)
         return self.encoder(observations.float())
 
     def decode_actions(self, hidden):
@@ -93,8 +109,15 @@ class Default(nn.Module):
             logits = torch.distributions.Normal(mean, std)
         else:
             logits = self.decoder(hidden)
-
+        if self.q_value_critic or self.multiobjective_reward:
+            logits = logits.view(-1, self.num_atns)
+        
         values = self.value(hidden)
+        if self.q_value_critic and self.multiobjective_reward:
+            values = values.view(-1, self.reward_dim, self.num_atns)
+        elif self.q_value_critic:
+            values = values.view(-1, self.num_atns)
+
         return logits, values
 
 class LSTMWrapper(nn.Module):
@@ -105,6 +128,10 @@ class LSTMWrapper(nn.Module):
         See the Default policy for an example.'''
         super().__init__()
         self.obs_shape = env.single_observation_space.shape
+        self.multiobjective_reward = policy.multiobjective_reward if hasattr(policy, 'multiobjective_reward') else False
+        self.weight_conditioning = policy.weight_conditioning if hasattr(policy, 'weight_conditioning') else False
+        self.reward_dim = policy.reward_dim if hasattr(policy, 'reward_dim') else 1
+        self.q_value_critic = policy.q_value_critic if hasattr(policy, 'q_value_critic') else False
 
         self.policy = policy
         self.input_size = input_size
@@ -177,6 +204,9 @@ class LSTMWrapper(nn.Module):
             lstm_state = None
 
         x = x.reshape(B*TT, *space_shape)
+        if 'weight' in state:
+            state = dict(state)
+            state['weight'] = state['weight'].reshape(B*TT, -1)
         hidden = self.policy.encode_observations(x, state)
         assert hidden.shape == (B*TT, self.input_size)
 
@@ -192,7 +222,12 @@ class LSTMWrapper(nn.Module):
 
         flat_hidden = hidden.reshape(B*TT, self.hidden_size)
         logits, values = self.policy.decode_actions(flat_hidden)
-        values = values.reshape(B, TT)
+        if self.multiobjective_reward and self.q_value_critic:
+            values = values.reshape(B, TT, self.reward_dim, -1)
+        elif self.multiobjective_reward or self.q_value_critic:
+            values = values.reshape(B, TT, -1)
+        else:
+            values = values.reshape(B, TT)
         #state.batch_logits = logits.reshape(B, TT, -1)
         state['hidden'] = hidden
         state['lstm_h'] = lstm_h.detach()

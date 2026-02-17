@@ -1,16 +1,24 @@
 #include "raylib.h"
-#include "tetrominoes.h"
+#include "../tetris/tetrominoes.h"
 #include <assert.h>
 #include <limits.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <gsl/gsl_rng.h>
+#include <gsl/gsl_randist.h>
+#include <time.h>
+
+#define REWARD_DIM 3  // combo, hard_drop, rotate
+#define REWARD_COMBO_IDX 0
+#define REWARD_HARD_DROP_IDX 1
+#define REWARD_ROTATE_IDX 2
+
+const double dirichlet_alpha[] = {1.0, 1.0, 1.0};
 
 static inline int min(int a, int b) { return a < b ? a : b; }
 static inline int max(int a, int b) { return a > b ? a : b; }
-
-#define USE_GAMMA
 
 #define HALF_LINEWIDTH 1
 #define SQUARE_SIZE 32
@@ -38,7 +46,6 @@ static inline int max(int a, int b) { return a > b ? a : b; }
 #define SCORE_HARD_DROP 2
 #define REWARD_HARD_DROP 0.02f
 #define REWARD_ROTATE 0.01f
-#define REWARD_INVALID_ACTION 0.0f
 
 const int SCORE_COMBO[5] = {0, 100, 300, 500, 1000};
 const float REWARD_COMBO[5] = {0, 0.1, 0.3, 0.5, 1.0};
@@ -48,10 +55,12 @@ typedef struct Log {
 	float score;
 	float ep_length;
 	float ep_return;
+	float scalarized_ep_return;
 	float ep_return_combo;
 	float ep_return_hard_drop;
 	float ep_return_rotate;
 	float discounted_ep_return;
+	float discounted_scalarized_ep_return;
 	float discounted_ep_return_combo;
 	float discounted_ep_return_hard_drop;
 	float discounted_ep_return_rotate;
@@ -63,6 +72,9 @@ typedef struct Log {
 	float atn_frac_hold;
 	float game_level;
 	float ticks_per_line;
+	float weight_combo;
+	float weight_hard_drop;
+	float weight_rotate;
 	float n;
 } Log;
 
@@ -75,12 +87,15 @@ typedef struct Client {
 	int preview_target_col;
 } Client;
 
-typedef struct Tetris {
+typedef struct TetrisMO {
 	Client *client;
 	Log log;
 	float *observations;
 	int *actions;
 	float *rewards;
+	float *weights;
+	bool manual_weights;
+	gsl_rng* gsl_rng;
 	double gamma;
     double gamma_t;
 	unsigned char *terminals;
@@ -115,10 +130,12 @@ typedef struct Tetris {
 	int cur_tetromino_rot;
 
 	float ep_return;
+	float scalarized_ep_return;
 	float ep_return_combo;
 	float ep_return_hard_drop;
 	float ep_return_rotate;
 	float discounted_ep_return;
+	float discounted_scalarized_ep_return;
 	float discounted_ep_return_combo;
 	float discounted_ep_return_hard_drop;
 	float discounted_ep_return_rotate;	
@@ -130,9 +147,9 @@ typedef struct Tetris {
 	int atn_count_rotate;
 	int atn_count_hold;
 	int tetromino_counts[NUM_TETROMINOES];
-} Tetris;
+} TetrisMO;
 
-void init(Tetris *env) {
+void init(TetrisMO *env) {
 	env->grid = (int *)calloc(env->n_rows * env->n_cols, sizeof(int));
 	if (env->grid == NULL) {
 		exit(1);
@@ -140,26 +157,44 @@ void init(Tetris *env) {
 	env->tetromino_deck = calloc(DECK_SIZE, sizeof(int));
 	if (env->tetromino_deck == NULL) {
 		exit(1);
+	}
+	env->gamma_t = env->gamma;
+    if (env->gsl_rng == NULL) {
+        env->gsl_rng = gsl_rng_alloc(gsl_rng_default);
+        gsl_rng_set(env->gsl_rng, time(NULL));
     }
 }
 
-void allocate(Tetris *env) {
+void allocate(TetrisMO *env) {
 	init(env);
 	// grid, 6 floats, 4 one-hot tetrominoes encode (current, previews, hold) + self-inflicting noisy action bits
 	env->dim_obs = env->n_cols * env->n_rows + NUM_FLOAT_OBS + NUM_TETROMINOES * (NUM_PREVIEW + 2) + env->n_noise_obs;
 	env->observations = (float *)calloc(env->dim_obs, sizeof(float));
 	env->actions = (int *)calloc(1, sizeof(int));
-	env->rewards = (float *)calloc(1, sizeof(float));
+	env->rewards = (float *)calloc(REWARD_DIM, sizeof(float));
+	env->weights = (float *)calloc(REWARD_DIM, sizeof(float));
 	env->terminals = (unsigned char *)calloc(1, sizeof(unsigned char));
     env->done = false;
+
+	// Sample initial reward weights (unless manually set)
+	if (!env->manual_weights) {
+		double weight_buffer[REWARD_DIM];
+		gsl_ran_dirichlet(env->gsl_rng, REWARD_DIM, dirichlet_alpha, weight_buffer);
+		for (int i = 0; i < REWARD_DIM; i++) {
+			env->weights[i] = (float)weight_buffer[i];
+		}
+	}
 }
 
-void c_close(Tetris *env) {
+void c_close(TetrisMO *env) {
 	free(env->grid);
 	free(env->tetromino_deck);
+	if (env->gsl_rng) {
+        gsl_rng_free(env->gsl_rng);
+    }
 }
 
-void free_allocated(Tetris *env) {
+void free_allocated(TetrisMO *env) {
 	free(env->actions);
 	free(env->observations);
 	free(env->terminals);
@@ -167,15 +202,17 @@ void free_allocated(Tetris *env) {
 	c_close(env);
 }
 
-void add_log(Tetris *env) {
+void add_log(TetrisMO *env) {
 	env->log.score += env->score;
 	env->log.perf += env->score / ((float)PERSONAL_BEST);
 	env->log.ep_length += env->tick;
 	env->log.ep_return += env->ep_return;
+	env->log.scalarized_ep_return += env->scalarized_ep_return;
 	env->log.ep_return_combo += env->ep_return_combo;
 	env->log.ep_return_hard_drop += env->ep_return_hard_drop;
 	env->log.ep_return_rotate += env->ep_return_rotate;
 	env->log.discounted_ep_return += env->discounted_ep_return;
+	env->log.discounted_scalarized_ep_return += env->discounted_scalarized_ep_return;
 	env->log.discounted_ep_return_combo += env->discounted_ep_return_combo;
 	env->log.discounted_ep_return_hard_drop += env->discounted_ep_return_hard_drop;
 	env->log.discounted_ep_return_rotate += env->discounted_ep_return_rotate;
@@ -188,9 +225,12 @@ void add_log(Tetris *env) {
 	env->log.game_level += env->game_level;
 	env->log.ticks_per_line += (env->lines_deleted > 0) ? ((float)env->tick / (float)env->lines_deleted) : (float)env->tick;
 	env->log.n += 1;
+	env->log.weight_combo = env->weights[0];
+	env->log.weight_hard_drop = env->weights[1];
+	env->log.weight_rotate = env->weights[2];
 }
 
-void compute_observations(Tetris *env) {
+void compute_observations(TetrisMO *env) {
 	// content of the grid: 0 for empty, 1 for placed blocks, 2 for the current tetromino
 	for (int i = 0; i < env->n_cols * env->n_rows; i++) {
 		env->observations[i] = env->grid[i] != 0;
@@ -238,7 +278,7 @@ void compute_observations(Tetris *env) {
 	}
 }
 
-void restore_grid(Tetris *env) { memset(env->grid, 0, env->n_rows * env->n_cols * sizeof(int)); }
+void restore_grid(TetrisMO *env) { memset(env->grid, 0, env->n_rows * env->n_cols * sizeof(int)); }
 
 void refill_and_shuffle(int *array) {
 	// Hold can change the deck distribution, so need to refill
@@ -255,7 +295,7 @@ void refill_and_shuffle(int *array) {
 	}
 }
 
-void initialize_deck(Tetris *env) {
+void initialize_deck(TetrisMO *env) {
 	// Implements a 7-bag system. The deck is composed of two bags.
 	refill_and_shuffle(env->tetromino_deck); // First bag
 	refill_and_shuffle(env->tetromino_deck + NUM_TETROMINOES); // Second bag
@@ -263,7 +303,7 @@ void initialize_deck(Tetris *env) {
 	env->cur_tetromino = env->tetromino_deck[env->cur_position_in_deck];
 }
 
-void spawn_new_tetromino(Tetris *env) {
+void spawn_new_tetromino(TetrisMO *env) {
 	env->cur_position_in_deck = (env->cur_position_in_deck + 1) % DECK_SIZE;
 	env->cur_tetromino = env->tetromino_deck[env->cur_position_in_deck];
 	env->cur_tetromino_rot = 0;
@@ -283,7 +323,7 @@ void spawn_new_tetromino(Tetris *env) {
 }
 
 // This is only used to check if the game is done
-bool can_spawn_new_tetromino(Tetris *env) {
+bool can_spawn_new_tetromino(TetrisMO *env) {
 	int next_pos = (env->cur_position_in_deck + 1) % DECK_SIZE;
 	int next_tetromino = env->tetromino_deck[next_pos];
 	for (int c = 0; c < TETROMINOES_FILLS_COL[next_tetromino][0]; c++) {
@@ -296,7 +336,7 @@ bool can_spawn_new_tetromino(Tetris *env) {
 	return true;
 }
 
-bool can_soft_drop(Tetris *env) {
+bool can_soft_drop(TetrisMO *env) {
 	if (env->cur_tetromino_row == (env->n_rows - TETROMINOES_FILLS_ROW[env->cur_tetromino][env->cur_tetromino_rot])) {
 		return false;
 	}
@@ -311,7 +351,7 @@ bool can_soft_drop(Tetris *env) {
 	return true;
 }
 
-bool can_go_left(Tetris *env) {
+bool can_go_left(TetrisMO *env) {
 	if (env->cur_tetromino_col == 0) {
 		return false;
 	}
@@ -326,7 +366,7 @@ bool can_go_left(Tetris *env) {
 	return true;
 }
 
-bool can_go_right(Tetris *env) {
+bool can_go_right(TetrisMO *env) {
 	if (env->cur_tetromino_col == (env->n_cols - TETROMINOES_FILLS_COL[env->cur_tetromino][env->cur_tetromino_rot])) {
 		return false;
 	}
@@ -341,7 +381,7 @@ bool can_go_right(Tetris *env) {
 	return true;
 }
 
-bool can_hold(Tetris *env) {
+bool can_hold(TetrisMO *env) {
 	if (env->can_swap == 0) {
 		return false;
 	}
@@ -359,7 +399,7 @@ bool can_hold(Tetris *env) {
 	return true;
 }
 
-bool can_rotate(Tetris *env) {
+bool can_rotate(TetrisMO *env) {
 	int next_rot = (env->cur_tetromino_rot + 1) % NUM_ROTATIONS;
 	if (env->cur_tetromino_col > (env->n_cols - TETROMINOES_FILLS_COL[env->cur_tetromino][next_rot])) {
 		return false;
@@ -378,7 +418,7 @@ bool can_rotate(Tetris *env) {
 	return true;
 }
 
-bool is_full_row(Tetris *env, int row) {
+bool is_full_row(TetrisMO *env, int row) {
 	for (int c = 0; c < env->n_cols; c++) {
 		if (env->grid[row * env->n_cols + c] == 0) {
 			return false;
@@ -387,7 +427,7 @@ bool is_full_row(Tetris *env, int row) {
 	return true;
 }
 
-void clear_row(Tetris *env, int row) {
+void clear_row(TetrisMO *env, int row) {
 	for (int r = row; r > 0; r--) {
 		for (int c = 0; c < env->n_cols; c++) {
 			env->grid[r * env->n_cols + c] = env->grid[(r - 1) * env->n_cols + c];
@@ -398,7 +438,7 @@ void clear_row(Tetris *env, int row) {
 	}
 }
 
-void add_garbage_lines(Tetris *env, int num_lines, int num_holes) {
+void add_garbage_lines(TetrisMO *env, int num_lines, int num_holes) {
 	// Check if adding garbage would cause an immediate game over
 	for (int r = 0; r < num_lines; r++) {
 		for (int c = 0; c < env->n_cols; c++) {
@@ -443,11 +483,11 @@ void add_garbage_lines(Tetris *env, int num_lines, int num_holes) {
 	env->cur_tetromino_row = max(0, env->cur_tetromino_row - num_lines);
 }
 
-void c_reset(Tetris *env) {
+void c_reset(TetrisMO *env) {
     if (env->freeze_on_done && env->done) {
         return;
     }
-
+	
 	env->score = 0;
 	env->hold_tetromino = -1;
 	env->tick = 0;
@@ -459,14 +499,19 @@ void c_reset(Tetris *env) {
 	env->can_swap = 1;
 
 	env->ep_return = 0.0;
+	env->scalarized_ep_return = 0.0;
 	env->ep_return_combo = 0.0;
 	env->ep_return_hard_drop = 0.0;
 	env->ep_return_rotate = 0.0;
 	env->gamma_t = env->gamma;
 	env->discounted_ep_return = 0.0;
+	env->discounted_scalarized_ep_return = 0.0;
 	env->discounted_ep_return_combo = 0.0;
 	env->discounted_ep_return_hard_drop = 0.0;
-	env->discounted_ep_return_rotate = 0.0;
+	env->discounted_ep_return_rotate = 0.0;	
+	env->rewards[0] = 0.0;
+	env->rewards[1] = 0.0;
+	env->rewards[2] = 0.0;
 	env->count_combos = 0;
 	env->lines_deleted = 0;
 	env->atn_count_hard_drop = 0;
@@ -488,9 +533,20 @@ void c_reset(Tetris *env) {
 	initialize_deck(env);
 	spawn_new_tetromino(env);
 	compute_observations(env);
+
+	// Sample new reward weights for next episode (unless manually set)
+	if (env->manual_weights) {
+		return;
+	}
+
+	double weight_buffer[REWARD_DIM];
+	gsl_ran_dirichlet(env->gsl_rng, REWARD_DIM, dirichlet_alpha, weight_buffer);
+	for (int i = 0; i < REWARD_DIM; i++) {
+		env->weights[i] = (float)weight_buffer[i];
+	}
 }
 
-void place_tetromino(Tetris *env) {
+void place_tetromino(TetrisMO *env) {
 	int row_to_check = env->cur_tetromino_row + TETROMINOES_FILLS_ROW[env->cur_tetromino][env->cur_tetromino_rot] - 1;
 	int lines_deleted = 0;
 	env->can_swap = 1;
@@ -518,11 +574,14 @@ void place_tetromino(Tetris *env) {
 		env->lines_deleted += lines_deleted;
 		env->score += SCORE_COMBO[lines_deleted];
 		float reward_combo = REWARD_COMBO[lines_deleted];
-		env->rewards[0] += reward_combo;
+		env->rewards[REWARD_COMBO_IDX] += reward_combo;
 		env->ep_return += reward_combo;
 		env->ep_return_combo += reward_combo;
 		env->discounted_ep_return += env->gamma_t * reward_combo;
 		env->discounted_ep_return_combo += env->gamma_t * reward_combo;
+		float scalarized_reward = reward_combo * env->weights[REWARD_COMBO_IDX];
+		env->scalarized_ep_return += scalarized_reward;
+		env->discounted_scalarized_ep_return += env->gamma_t * scalarized_reward;
 
 		// These determine the game difficulty. Consider making them args.
 		env->game_level = 1 + env->lines_deleted / LINES_PER_LEVEL;
@@ -537,13 +596,15 @@ void place_tetromino(Tetris *env) {
 	}
 }
 
-void c_step(Tetris *env) {
+void c_step(TetrisMO *env) {
     if (env->freeze_on_done && env->done) {
         return;
     }
 
 	env->terminals[0] = 0;
 	env->rewards[0] = 0.0;
+	env->rewards[1] = 0.0;
+	env->rewards[2] = 0.0;
 	env->tick += 1;
 	env->tick_fall += 1;
 	env->tick_garbage += 1;
@@ -552,34 +613,25 @@ void c_step(Tetris *env) {
 	if (action == ACTION_LEFT) {
 		if (can_go_left(env)) {
 			env->cur_tetromino_col -= 1;
-		} else {
-			env->rewards[0] += REWARD_INVALID_ACTION;
-			env->ep_return += REWARD_INVALID_ACTION;
-			env->discounted_ep_return += env->gamma_t * REWARD_INVALID_ACTION;		
 		}
 	}
 	if (action == ACTION_RIGHT) {
 		if (can_go_right(env)) {
 			env->cur_tetromino_col += 1;
-		} else {
-			env->rewards[0] += REWARD_INVALID_ACTION;
-			env->ep_return += REWARD_INVALID_ACTION;
-			env->discounted_ep_return += env->gamma_t * REWARD_INVALID_ACTION;		
 		}
 	}
 	if (action == ACTION_ROTATE) {
 		env->atn_count_rotate += 1;
 		if (can_rotate(env)) {
 			env->cur_tetromino_rot = (env->cur_tetromino_rot + 1) % NUM_ROTATIONS;
-			env->rewards[0] += REWARD_ROTATE;
+			env->rewards[REWARD_ROTATE_IDX] += REWARD_ROTATE;
 			env->ep_return += REWARD_ROTATE;
 			env->ep_return_rotate += REWARD_ROTATE;
 			env->discounted_ep_return += env->gamma_t * REWARD_ROTATE;
 			env->discounted_ep_return_rotate += env->gamma_t * REWARD_ROTATE;
-		} else {
-			env->rewards[0] += REWARD_INVALID_ACTION;
-			env->ep_return += REWARD_INVALID_ACTION;
-			env->discounted_ep_return += env->gamma_t * REWARD_INVALID_ACTION;		
+			float scalarized_reward = REWARD_ROTATE * env->weights[REWARD_ROTATE_IDX];
+			env->scalarized_ep_return += scalarized_reward;
+			env->discounted_scalarized_ep_return += env->gamma_t * scalarized_reward;
 		}
 	}
 	if (action == ACTION_SOFT_DROP) {
@@ -589,10 +641,6 @@ void c_step(Tetris *env) {
 			env->score += SCORE_SOFT_DROP;
 			// env->rewards[0] += REWARD_SOFT_DROP;
 			// env->ep_return += REWARD_SOFT_DROP;
-		} else {
-			env->rewards[0] += REWARD_INVALID_ACTION;
-			env->ep_return += REWARD_INVALID_ACTION;
-			env->discounted_ep_return += env->gamma_t * REWARD_INVALID_ACTION;		
 		}
 	}
 	if (action == ACTION_HOLD) {
@@ -614,10 +662,6 @@ void c_step(Tetris *env) {
 				env->cur_tetromino_row = 0;
 				env->tick_fall = 0;
 			}
-		} else {
-			env->rewards[0] += REWARD_INVALID_ACTION;
-			env->ep_return += REWARD_INVALID_ACTION;
-			env->discounted_ep_return += env->gamma_t * REWARD_INVALID_ACTION;		
 		}
 	}
 	if (action == ACTION_HARD_DROP) {
@@ -625,11 +669,14 @@ void c_step(Tetris *env) {
 		while (can_soft_drop(env)) {
 			env->cur_tetromino_row += 1;
 			// NOTE: this seems to be a super effective reward trick
-			env->rewards[0] += REWARD_HARD_DROP;
+			env->rewards[REWARD_HARD_DROP_IDX] += REWARD_HARD_DROP;
 			env->ep_return += REWARD_HARD_DROP;
 			env->ep_return_hard_drop += REWARD_HARD_DROP;
 			env->discounted_ep_return += env->gamma_t * REWARD_HARD_DROP;
 			env->discounted_ep_return_hard_drop += env->gamma_t * REWARD_HARD_DROP;
+			float scalarized_reward = REWARD_HARD_DROP * env->weights[REWARD_HARD_DROP_IDX];
+			env->scalarized_ep_return += scalarized_reward;
+			env->discounted_scalarized_ep_return += env->gamma_t * scalarized_reward;
 		}
 		env->score += SCORE_HARD_DROP;
 		place_tetromino(env);
@@ -667,7 +714,7 @@ void c_step(Tetris *env) {
 	compute_observations(env);
 }
 
-Client *make_client(Tetris *env) {
+Client *make_client(TetrisMO *env) {
 	Client *client = (Client *)calloc(1, sizeof(Client));
 	client->ui_rows = 1;
 	client->deck_rows = SIZE;
@@ -675,7 +722,7 @@ Client *make_client(Tetris *env) {
 	client->total_cols = max(1 + env->n_cols + 1, 1 + 3 * NUM_PREVIEW);
 	client->preview_target_col = env->n_cols / 2;
 	client->preview_target_rotation = 0;
-	InitWindow(SQUARE_SIZE * client->total_cols, SQUARE_SIZE * client->total_rows, "PufferLib Tetris");
+	InitWindow(SQUARE_SIZE * client->total_cols, SQUARE_SIZE * client->total_rows, "PufferLib TetrisMO");
 	SetTargetFPS(30);
 	return client;
 }
@@ -691,7 +738,7 @@ Color DASH_COLOR_BRIGHT = (Color){150, 150, 150, 255};
 Color DASH_COLOR_DARK = (Color){50, 50, 50, 255};
 // Color GARBAGE_COLOR = (Color){140, 140, 140, 255};
 
-void c_render(Tetris *env) {
+void c_render(TetrisMO *env) {
 	if (env->client == NULL) {
 		env->client = make_client(env);
 	}

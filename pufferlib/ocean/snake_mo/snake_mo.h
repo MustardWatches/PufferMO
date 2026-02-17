@@ -4,6 +4,9 @@
 #include <string.h>
 #include <math.h>
 #include "raylib.h"
+#include <gsl/gsl_rng.h>
+#include <gsl/gsl_randist.h>
+#include <time.h>
 
 #define USE_GAMMA
 
@@ -12,28 +15,43 @@
 #define CORPSE 2
 #define WALL 3
 
+// Multi-objective: 3 reward components
+#define REWARD_DIM 3
+#define REWARD_FOOD_IDX 0
+#define REWARD_CORPSE_IDX 1
+#define REWARD_DEATH_IDX 2
+
+// Uniform Dirichlet for equal preference initialization
+const double dirichlet_alpha[] = {1.0, 1.0, 1.0};
+
 typedef struct Log Log;
 struct Log {
     float perf;
     float score;
     float episode_return;
+    float scalarized_episode_return;
     float discounted_episode_return;
+    float discounted_scalarized_episode_return;
     float episode_return_food;
     float episode_return_corpse;
     float episode_return_death;
     float discounted_episode_return_food;
     float discounted_episode_return_corpse;
     float discounted_episode_return_death;
+    float weight_food;
+    float weight_corpse;
+    float weight_death;
     float episode_length;
     float n;
 };
 
 typedef struct Client Client;
-typedef struct CSnake CSnake;
-struct CSnake {
+typedef struct CSnakeMO CSnakeMO;
+struct CSnakeMO {
     char* observations;
     int* actions;
     float* rewards;
+    float* weights;
     unsigned char* terminals;
     Log log;
     Log* snake_logs;
@@ -55,6 +73,9 @@ struct CSnake {
     float reward_food;
     float reward_corpse;
     float reward_death;
+    float weight_food;
+    float weight_corpse;
+    float weight_death;
     int tick;
     int max_ticks;
     int max_ticks_offset_mod;
@@ -64,6 +85,8 @@ struct CSnake {
     int cell_size;
     double gamma;
     double gamma_t;
+    bool manual_weights;
+    gsl_rng* gsl_rng;
     Client* client;
 };
 
@@ -72,22 +95,27 @@ struct CSnake {
  * This should only be called during termination/truncation conditions for a specific snake.
  * Accumulates the snake's stats into the main log and resets the snake's individual log.
  */
-void add_log(CSnake* env, int snake_id) {
+void add_log(CSnakeMO* env, int snake_id) {
     env->log.perf += env->snake_logs[snake_id].perf;
     env->log.score += env->snake_logs[snake_id].score;
     env->log.episode_return += env->snake_logs[snake_id].episode_return;
+    env->log.scalarized_episode_return += env->snake_logs[snake_id].scalarized_episode_return;
     env->log.discounted_episode_return += env->snake_logs[snake_id].discounted_episode_return;
+    env->log.discounted_scalarized_episode_return += env->snake_logs[snake_id].discounted_scalarized_episode_return;
     env->log.discounted_episode_return_food += env->snake_logs[snake_id].discounted_episode_return_food;
     env->log.discounted_episode_return_corpse += env->snake_logs[snake_id].discounted_episode_return_corpse;
     env->log.discounted_episode_return_death += env->snake_logs[snake_id].discounted_episode_return_death;
     env->log.episode_return_food += env->snake_logs[snake_id].episode_return_food;
     env->log.episode_return_corpse += env->snake_logs[snake_id].episode_return_corpse;
     env->log.episode_return_death += env->snake_logs[snake_id].episode_return_death;
+    env->log.weight_food += env->snake_logs[snake_id].weight_food;
+    env->log.weight_corpse += env->snake_logs[snake_id].weight_corpse;
+    env->log.weight_death += env->snake_logs[snake_id].weight_death;
     env->log.episode_length += env->snake_logs[snake_id].episode_length;
     env->log.n += 1;
 }
 
-void init_csnake(CSnake* env) {
+void init_csnake(CSnakeMO* env) {
     env->grid = (char*)calloc(env->width*env->height, sizeof(char));
     env->snake = (int*)calloc(env->num_snakes*2*env->max_snake_length, sizeof(int));
     env->snake_lengths = (int*)calloc(env->num_snakes, sizeof(int));
@@ -97,13 +125,21 @@ void init_csnake(CSnake* env) {
     env->snake_logs = (Log*)calloc(env->num_snakes, sizeof(Log));
     env->tick = 0;
     env->gamma_t = env->gamma;
+    env->manual_weights = false;
     env->client = NULL;
+    
+    // Initialize GSL RNG if not already initialized
+    if (env->gsl_rng == NULL) {
+        env->gsl_rng = gsl_rng_alloc(gsl_rng_default);
+        gsl_rng_set(env->gsl_rng, time(NULL));
+    }
+    
     env->snake_colors[0] = 7;
     for (int i = 1; i<env->num_snakes; i++)
         env->snake_colors[i] = i%4 + 4; // Randomize snake colors
 }
 
-void c_close(CSnake* env) {
+void c_close(CSnakeMO* env) {
     free(env->grid);
     free(env->snake);
     free(env->snake_lengths);
@@ -111,26 +147,32 @@ void c_close(CSnake* env) {
     free(env->snake_lifetimes);
     free(env->snake_colors);
     free(env->snake_logs);
+    if (env->gsl_rng) {
+        gsl_rng_free(env->gsl_rng);
+    }
 }
-void allocate_csnake(CSnake* env) {
+
+void allocate_csnake(CSnakeMO* env) {
     int obs_size = (2*env->vision + 1) * (2*env->vision + 1);
     env->observations = (char*)calloc(env->num_snakes*obs_size, sizeof(char));
     env->actions = (int*)calloc(env->num_snakes, sizeof(int));
-    env->rewards = (float*)calloc(env->num_snakes, sizeof(float));
+    env->rewards = (float*)calloc(env->num_snakes * REWARD_DIM, sizeof(float));
+    env->weights = (float*)calloc(env->num_snakes * REWARD_DIM, sizeof(float));
     env->terminals = (unsigned char*)calloc(env->num_snakes, sizeof(unsigned char));
     env->done = false;
     init_csnake(env);
 }
 
-void free_csnake(CSnake* env) {
+void free_csnake(CSnakeMO* env) {
     c_close(env);
     free(env->observations);
     free(env->actions);
     free(env->rewards);
+    free(env->weights);
     free(env->terminals);
 }
 
-void compute_observations(CSnake* env) {
+void compute_observations(CSnakeMO* env) {
     for (int i = 0; i < env->num_snakes; i++) {
         int head_ptr = i*2*env->max_snake_length + 2*env->snake_ptr[i];
         int r_offset = env->snake[head_ptr] - env->vision;
@@ -144,7 +186,7 @@ void compute_observations(CSnake* env) {
     }
 }
 
-void delete_snake(CSnake* env, int snake_id) {
+void delete_snake(CSnakeMO* env, int snake_id) {
     while (env->snake_lengths[snake_id] > 0) {
         int head_ptr = env->snake_ptr[snake_id];
         int head_offset = 2*env->max_snake_length*snake_id + 2*head_ptr;
@@ -165,7 +207,7 @@ void delete_snake(CSnake* env, int snake_id) {
     }
 }
 
-void spawn_snake(CSnake* env, int snake_id) {
+void spawn_snake(CSnakeMO* env, int snake_id) {
     int head_r, head_c, tile, grid_idx;
     delete_snake(env, snake_id);
     do {
@@ -184,7 +226,7 @@ void spawn_snake(CSnake* env, int snake_id) {
     env->snake_logs[snake_id] = (Log){0};
 }
 
-void spawn_food(CSnake* env) {
+void spawn_food(CSnakeMO* env) {
     int idx, tile;
     do {
         int r = rand() % (env->height - 1);
@@ -195,7 +237,7 @@ void spawn_food(CSnake* env) {
     env->grid[idx] = FOOD;
 }
 
-void c_reset(CSnake* env) {
+void c_reset(CSnakeMO* env) {
     if (env->freeze_on_done && env->done) {
         return;
     }
@@ -241,9 +283,22 @@ void c_reset(CSnake* env) {
         spawn_food(env);
 
     compute_observations(env);
+
+    // Sample new reward weights for each episode (unless manually set)
+    if (env->manual_weights) {
+        return;
+    }
+        
+    double shared_weight_buffer[REWARD_DIM];
+    gsl_ran_dirichlet(env->gsl_rng, REWARD_DIM, dirichlet_alpha, shared_weight_buffer);
+    for (int j = 0; j < env->num_snakes; j++) {
+        for (int i = 0; i < REWARD_DIM; i++) {
+            env->weights[j * REWARD_DIM + i] = (float)shared_weight_buffer[i];
+        }
+    }
 }
 
-void step_snake(CSnake* env, int i) {
+void step_snake(CSnakeMO* env, int i) {
     env->snake_logs[i].episode_length += 1;
     int atn = env->actions[i];
     int dr = 0;
@@ -272,13 +327,34 @@ void step_snake(CSnake* env, int i) {
         next_c = env->snake[head_offset + 1] - dc;
     }
 
+    float weight_food = env->weights[i * REWARD_DIM + REWARD_FOOD_IDX];
+    float weight_corpse = env->weights[i * REWARD_DIM + REWARD_CORPSE_IDX];
+    float weight_death = env->weights[i * REWARD_DIM + REWARD_DEATH_IDX];
+
+    env->snake_logs[i].weight_food = weight_food;
+    env->snake_logs[i].weight_corpse = weight_corpse;
+    env->snake_logs[i].weight_death = weight_death;
+
+    float reward_food = 0.0f;
+    float reward_corpse = 0.0f;
+    float reward_death = 0.0f;
+    
+    // Initialize reward components to zero
+    for (int j = 0; j < REWARD_DIM; j++) {
+        env->rewards[i * REWARD_DIM + j] = 0.0f;
+    }
+
     int tile = env->grid[next_r*env->width + next_c];
     if (tile >= WALL) {
-        env->rewards[i] = env->reward_death;
-        env->snake_logs[i].episode_return += env->reward_death;
-        env->snake_logs[i].episode_return_death += env->reward_death;
-        env->snake_logs[i].discounted_episode_return += env->gamma_t * env->reward_death;
-        env->snake_logs[i].discounted_episode_return_death += env->gamma_t * env->reward_death;
+        reward_death = env->reward_death;
+        env->rewards[i * REWARD_DIM + REWARD_DEATH_IDX] = reward_death;
+        env->snake_logs[i].episode_return_death += reward_death;
+        float scalarized_reward = reward_death * weight_death;
+        env->snake_logs[i].episode_return += reward_death;
+        env->snake_logs[i].scalarized_episode_return += scalarized_reward;
+        env->snake_logs[i].discounted_episode_return += env->gamma_t * reward_death;
+        env->snake_logs[i].discounted_scalarized_episode_return += env->gamma_t * scalarized_reward;        
+        env->snake_logs[i].discounted_episode_return_death += env->gamma_t * reward_death;
         env->snake_logs[i].score = env->snake_lengths[i];
         env->snake_logs[i].perf = env->snake_logs[i].score / env->snake_logs[i].episode_length;
         add_log(env, i);
@@ -297,25 +373,28 @@ void step_snake(CSnake* env, int i) {
 
     bool grow;
     if (tile == FOOD) {
-        env->rewards[i] = env->reward_food;
-        env->snake_logs[i].episode_return += env->reward_food;
-        env->snake_logs[i].episode_return_food += env->reward_food;
-        env->snake_logs[i].discounted_episode_return += env->gamma_t * env->reward_food;
-        env->snake_logs[i].discounted_episode_return_food += env->gamma_t * env->reward_food;
+        reward_food = env->reward_food;
         spawn_food(env);
         grow = true;
     } else if (tile == CORPSE) {
-        env->rewards[i] = env->reward_corpse;
-        env->snake_logs[i].episode_return += env->reward_corpse;
-        env->snake_logs[i].episode_return_corpse += env->reward_corpse;
-        env->snake_logs[i].discounted_episode_return += env->gamma_t * env->reward_corpse;
-        env->snake_logs[i].discounted_episode_return_corpse += env->gamma_t * env->reward_corpse;
+        reward_corpse = env->reward_corpse;
         grow = true;
     } else {
-        env->rewards[i] = 0.0;
         grow = false;
     }
 
+    env->rewards[i * REWARD_DIM + REWARD_FOOD_IDX] = reward_food;
+    env->rewards[i * REWARD_DIM + REWARD_CORPSE_IDX] = reward_corpse;
+    env->snake_logs[i].episode_return += reward_food + reward_corpse;
+    env->snake_logs[i].episode_return_food += reward_food;
+    env->snake_logs[i].episode_return_corpse += reward_corpse;
+    env->snake_logs[i].discounted_episode_return += env->gamma_t * (reward_food + reward_corpse);
+    env->snake_logs[i].discounted_episode_return_food += env->gamma_t * reward_food;
+    env->snake_logs[i].discounted_episode_return_corpse += env->gamma_t * reward_corpse;
+    float scalarized_reward = reward_food * weight_food + reward_corpse * weight_corpse;
+    env->snake_logs[i].scalarized_episode_return += scalarized_reward;
+    env->snake_logs[i].discounted_scalarized_episode_return += env->gamma_t * scalarized_reward;
+    
     int snake_length = env->snake_lengths[i];
     if (grow && snake_length < env->max_snake_length - 1) {
         env->snake_lengths[i]++;
@@ -333,11 +412,11 @@ void step_snake(CSnake* env, int i) {
     env->grid[next_r*env->width + next_c] = env->snake_colors[i];
 }
 
-void c_step(CSnake* env){
+void c_step(CSnakeMO* env){
     if (env->freeze_on_done && env->done) {
         return;
     }
-
+    
     env->tick++;
     env->gamma_t *= env->gamma;
 
@@ -393,7 +472,7 @@ Client* make_client(int cell_size, int width, int height) {
     client->cell_size = cell_size;
     client->width = width;
     client->height = height;
-    InitWindow(width*cell_size, height*cell_size, "PufferLib Snake");
+    InitWindow(width*cell_size, height*cell_size, "PufferLib Snake MO");
     SetTargetFPS(10);
     return client;
 }
@@ -403,7 +482,7 @@ void close_client(Client* client) {
     free(client);
 }
 
-void c_render(CSnake* env) {
+void c_render(CSnakeMO* env) {
     if (IsKeyDown(KEY_ESCAPE)) {
         exit(0);
     }

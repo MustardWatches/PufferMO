@@ -30,6 +30,7 @@ BUID_CUDA_EXT = bool(CUDA_HOME or ROCM_HOME)
 DEBUG = os.getenv("DEBUG", "0") == "1"
 NO_OCEAN = os.getenv("NO_OCEAN", "0") == "1"
 NO_TRAIN = os.getenv("NO_TRAIN", "0") == "1"
+NO_MO = os.getenv("NO_MO", "0") == "1"
 
 # Build raylib for your platform
 RAYLIB_URL = 'https://github.com/raysan5/raylib/releases/download/5.5/'
@@ -78,7 +79,9 @@ extra_compile_args = [
     '-DPLATFORM_DESKTOP',
 ]
 extra_link_args = [
-    '-fwrapv'
+    '-fwrapv',
+    '-lgsl',
+    '-lgslcblas',
 ]
 cxx_args = [
     '-fdiagnostics-color=always',
@@ -292,6 +295,11 @@ if not NO_TRAIN:
         'heavyball>=2.2.0', # contains relevant fixes compared to 1.7.2 and 2.1.1
         'neptune',
         'wandb',
+    ]
+
+if not NO_MO:
+    install_requires += [
+        'pymoo>=0.6.0',
     ]
 
 setup(

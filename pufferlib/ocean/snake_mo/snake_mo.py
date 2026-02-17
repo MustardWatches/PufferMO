@@ -1,13 +1,13 @@
-'''High-perf many-agent snake. Inspired by snake env from https://github.com/dnbt777'''
+'''High-perf many-agent snake with multi-objective rewards. Inspired by snake env from https://github.com/dnbt777'''
 
 import numpy as np
 import gymnasium
 
 import pufferlib
 from pufferlib import APIUsageError
-from pufferlib.ocean.snake import binding
+from pufferlib.ocean.snake_mo import binding
 
-class Snake(pufferlib.PufferEnv):
+class SnakeMO(pufferlib.PufferEnv):
     def __init__(self, num_envs=16, width=640, height=360,
             num_snakes=256, num_food=4096,
             vision=5, leave_corpse_on_death=True,
@@ -18,7 +18,7 @@ class Snake(pufferlib.PufferEnv):
 
         self.num_envs = num_envs
         self.freeze_on_done = freeze_on_done
-            
+
         if num_envs is not None:
             num_snakes = num_envs * [num_snakes]
             width = num_envs * [width]
@@ -42,20 +42,31 @@ class Snake(pufferlib.PufferEnv):
         self.single_observation_space = gymnasium.spaces.Box(
             low=0, high=2, shape=(2*vision+1, 2*vision+1), dtype=np.int8)
         self.single_action_space = gymnasium.spaces.Discrete(4)
+        
+        self.reward_dim = 3  # food, corpse, death
+        self.single_reward_space = gymnasium.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(self.reward_dim,),
+            dtype=np.float32
+        )
+        
         self.num_agents = sum(num_snakes)
         self.render_mode = render_mode
         self.tick = 0
 
         self.cell_size = int(np.ceil(1280 / max(max(width), max(height))))
 
-        super().__init__(buf)
+        # Enable vector rewards
+        super().__init__(buf, multiobjective_reward=True)
         c_envs = []
         offset = 0
         for i in range(num_envs):
             ns = num_snakes[i]
             obs_slice = self.observations[offset:offset+ns]
             act_slice = self.actions[offset:offset+ns]
-            rew_slice = self.rewards[offset:offset+ns]
+            rew_slice = self.rewards[offset:offset+ns,:]
+            weights_slice = self.weights[offset:offset+ns,:]
             term_slice = self.terminals[offset:offset+ns]
             trunc_slice = self.truncations[offset:offset+ns]
             # Seed each env uniquely: i + seed * num_envs
@@ -63,7 +74,8 @@ class Snake(pufferlib.PufferEnv):
             env_id = binding.env_init(
                 obs_slice, 
                 act_slice, 
-                rew_slice, 
+                rew_slice,
+                weights_slice,
                 term_slice, 
                 trunc_slice,
                 env_seed,
@@ -88,8 +100,8 @@ class Snake(pufferlib.PufferEnv):
         self.c_envs = binding.vectorize(*c_envs)
         if self.freeze_on_done:
             self.infos = [{} for _ in range(num_envs)]
-            self.done_envs = [False for _ in range(num_envs)]        
- 
+            self.done_envs = [False for _ in range(num_envs)]
+
     def reset(self, seed=None):
         self.tick = 0
         if seed is None:
@@ -119,8 +131,11 @@ class Snake(pufferlib.PufferEnv):
             if self.tick % self.report_interval == 0:
                 infos.append(binding.vec_log(self.c_envs))
 
-        return (self.observations, self.rewards,
+        return (self.observations, self.rewards, self.weights,
             self.terminals, self.truncations, infos)
+
+    def set_weights(self, weights):
+        binding.vec_put(self.c_envs, weights=weights)
 
     def render(self):
         binding.vec_render(self.c_envs, self.cell_size)
@@ -129,7 +144,7 @@ class Snake(pufferlib.PufferEnv):
         binding.vec_close(self.c_envs)
 
 def test_performance(timeout=10, atn_cache=1024):
-    env = Snake()
+    env = SnakeMO()
     env.reset()
     tick = 0
 

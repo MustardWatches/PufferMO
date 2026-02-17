@@ -162,3 +162,8 @@ pufferlib/ocean/impulse_wars/*-release/
 pufferlib/ocean/impulse_wars/debug-*/
 pufferlib/ocean/impulse_wars/release-*/
 pufferlib/ocean/impulse_wars/benchmark/
+
+# Artifacts
+artifacts/
+*.mp4
+*.pkl

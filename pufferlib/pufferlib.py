@@ -19,11 +19,15 @@ calling super() before you have assigned the attribute.
 '''
 
 
-def set_buffers(env, buf=None):
+def set_buffers(env, buf=None, multiobjective_reward=False):
     if buf is None:
         obs_space = env.single_observation_space
         env.observations = np.zeros((env.num_agents, *obs_space.shape), dtype=obs_space.dtype)
-        env.rewards = np.zeros(env.num_agents, dtype=np.float32)
+        if multiobjective_reward:
+            env.rewards = np.zeros((env.num_agents, env.reward_dim), dtype=np.float32)
+            env.weights = np.ones((env.num_agents, env.reward_dim), dtype=np.float32)
+        else:
+            env.rewards = np.zeros(env.num_agents, dtype=np.float32)
         env.terminals = np.zeros(env.num_agents, dtype=bool)
         env.truncations = np.zeros(env.num_agents, dtype=bool)
         env.masks = np.ones(env.num_agents, dtype=bool)
@@ -37,13 +41,15 @@ def set_buffers(env, buf=None):
     else:
         env.observations = buf['observations']
         env.rewards = buf['rewards']
+        if multiobjective_reward:
+            env.weights = buf['weights']
         env.terminals = buf['terminals']
         env.truncations = buf['truncations']
         env.masks = buf['masks']
         env.actions = buf['actions']
 
 class PufferEnv:
-    def __init__(self, buf=None):
+    def __init__(self, buf=None, multiobjective_reward=False):  # TODO PHM: Add a property flag for vector rewards and clean up its usage
         if not hasattr(self, 'single_observation_space'):
             raise APIUsageError(ENV_ERROR.format('single_observation_space'))
         if not hasattr(self, 'single_action_space'):
@@ -64,7 +70,7 @@ class PufferEnv:
                 and not isinstance(self.single_action_space, pufferlib.spaces.Box)):
             raise APIUsageError('Native action_space must be a Discrete, MultiDiscrete, or Box')
 
-        set_buffers(self, buf)
+        set_buffers(self, buf, multiobjective_reward)
 
         self.action_space = pufferlib.spaces.joint_space(self.single_action_space, self.num_agents)
         self.observation_space = pufferlib.spaces.joint_space(self.single_observation_space, self.num_agents)

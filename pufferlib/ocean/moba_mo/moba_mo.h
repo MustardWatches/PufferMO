@@ -6,6 +6,9 @@
 #include <math.h>
 #include <time.h> // xxd -i game_map.npy > game_map.h #include "game_map.h"
 
+#include <gsl/gsl_rng.h>
+#include <gsl/gsl_randist.h>
+
 #include "raylib.h"
 
 #if defined(PLATFORM_DESKTOP)
@@ -13,6 +16,8 @@
 #else
     #define GLSL_VERSION 100
 #endif
+
+#define REWARD_DIM 3  // death, xp, tower
 
 #define USE_GAMMA
 
@@ -71,17 +76,17 @@ const float TOWER_Y[] = {112.01538461538462, 96.87692307692308, 91.2153846153846
 const float WAYPOINTS[][20][2] = {{{96.26153846153846, 14.04615384615385}, {93.61538461538461, 14.292307692307695}, {58.23076923076923, 16.07692307692308}, {43.4, 16.01538461538462}, {32.10769230769231, 17.584615384615383}, {24.93846153846154, 19.123076923076923}, {22.96923076923077, 20.446153846153848}, {21.06153846153846, 25.307692307692307}, {20.200000000000003, 30.47692307692308}, {19.4, 35.892307692307696}, {18.47692307692308, 43.52307692307693}, {18.04615384615385, 50.723076923076924}, {20.50769230769231, 94.66153846153847}, {27.676923076923075, 105.94615384615385}}, {{99.52307692307693, 26.47692307692308}, {98.66153846153847, 27.646153846153844}, {86.04615384615384, 41.12307692307692}, {71.33846153846154, 57.49230769230769}, {66.96923076923076, 62.23076923076923}, {64.07692307692308, 66.35384615384615}, {60.2, 72.01538461538462}, {51.892307692307696, 84.87692307692308}, {34.66153846153846, 99.4}, {28.169230769230772, 105.94615384615385}}, {{112.01538461538462, 36.93846153846154}, {112.01538461538462, 32.50769230769231}, {116.2, 68.6923076923077}, {113.73846153846154, 80.75384615384615}, {113.55384615384615, 90.53846153846155}, {113.21538461538461, 95.98461538461538}, {111.49230769230769, 100.93846153846154}, {109.06153846153846, 108.07692307692308}, {107.18461538461538, 111.36923076923077}, {101.73846153846154, 114.66153846153847}, {90.53846153846155, 111.76923076923077}, {39.4, 113.73846153846154}, {28.169230769230772, 106.43846153846154}}, {{20.446153846153848, 89.36923076923077}, {20.630769230769232, 94.66153846153847}, {18.784615384615385, 50.6}, {22.292307692307695, 24.50769230769231}, {22.815384615384616, 18.815384615384616}, {27.52307692307692, 17.03076923076923}, {35.03076923076923, 15.95384615384615}, {93.61538461538461, 14.415384615384617}, {103.64615384615385, 21.99230769230769}}, {{37.43076923076923, 96.50769230769231}, {34.53846153846154, 99.27692307692308}, {51.707692307692305, 84.38461538461539}, {59.83076923076923, 71.64615384615385}, {63.83076923076923, 66.1076923076923}, {66.72307692307692, 61.98461538461538}, {70.84615384615384, 57.246153846153845}, {98.53846153846155, 27.52307692307692}, {103.64615384615385, 22.48461538461538}}, {{36.93846153846154, 113.24615384615385}, {39.4, 113.61538461538461}, {62.292307692307695, 114.6}, {83.64615384615385, 114.6}, {90.66153846153847, 109.8}, {94.87692307692308, 112.01538461538462}, {104.26153846153846, 112.2923076923077}, {109.3076923076923, 107.83076923076922}, {112.23076923076923, 105.86153846153846}, {114.44615384615385, 72.96923076923076}, {111.8923076923077, 32.50769230769231}, {104.13846153846154, 22.48461538461538}}};
 const int WAYPOINTS_N[6] = {14, 10, 13, 9, 9, 12};
 
+const double dirichlet_alpha[] = {1.0, 1.0, 1.0, 1.0};
+
 #define LOG_BUFFER_SIZE 1024
 
 
 typedef struct PlayerLog PlayerLog;
 struct PlayerLog {
     float episode_return;
+    float scalarized_episode_return;
     float discounted_episode_return;
-    float reward_death;
-    float reward_xp;
-    float reward_distance;
-    float reward_tower;
+    float discounted_scalarized_episode_return;
     float level;
     float kills;
     float deaths;
@@ -103,18 +108,22 @@ struct Log {
     float perf;
     float score;
     float episode_return;
+    float scalarized_episode_return;
     float episode_return_death;
     float episode_return_xp;
     float episode_return_tower;
     float discounted_episode_return;
+    float discounted_scalarized_episode_return;
     float discounted_episode_return_death;
     float discounted_episode_return_xp;
     float discounted_episode_return_tower;
     float episode_length;
     float reward_death;
     float reward_xp;
-    float reward_distance;
     float reward_tower;
+    float weight_death;
+    float weight_xp;
+    float weight_tower;
  
     float radiant_victory;
     float radiant_level;
@@ -125,10 +134,11 @@ struct Log {
     float dire_towers_alive;
 
     float radiant_support_episode_return;
+    float radiant_support_scalarized_episode_return;
     float radiant_support_discounted_episode_return;
+    float radiant_support_discounted_scalarized_episode_return;
     float radiant_support_reward_death;
     float radiant_support_reward_xp;
-    float radiant_support_reward_distance;
     float radiant_support_reward_tower;
     float radiant_support_level;
     float radiant_support_kills;
@@ -163,10 +173,10 @@ struct Log {
 };
 
 
-typedef struct MOBA MOBA;
+typedef struct MOBA_MO MOBA_MO;
 typedef struct GameRenderer GameRenderer;
 typedef struct Entity Entity;
-typedef int (*skill)(MOBA*, Entity*, Entity*);
+typedef int (*skill)(MOBA_MO*, Entity*, Entity*);
 
 struct Entity {
     int pid;
@@ -230,7 +240,6 @@ static inline int ai_offset(int y_dst, int x_dst, int y_src, int x_src) {
 typedef struct {
     float death;
     float xp;
-    float distance;
     float tower;
 } Reward;
 
@@ -347,12 +356,13 @@ unsigned char* precompute_pathing(Map* map){
     return paths;
 }
 
-struct MOBA {
+struct MOBA_MO {
     GameRenderer* client;
     int vision_range;
     float agent_speed;
     bool discretize;
     bool script_opponents;
+    bool manual_weights;
     int obs_size;
     int creep_idx;
     int tick;
@@ -365,6 +375,7 @@ struct MOBA {
     unsigned char* observations;
     int* actions;
     float* rewards;
+    float* weights;
     unsigned char* terminals;
     unsigned char* truncations;
     Entity* entities;
@@ -374,7 +385,6 @@ struct MOBA {
 
     float reward_death;
     float reward_xp;
-    float reward_distance;
     float reward_tower;
     double gamma;
     double gamma_t;
@@ -393,9 +403,10 @@ struct MOBA {
     skill skills[10][3];
 
     CachedRNG *rng;
+    gsl_rng *gsl_rng;
 };
 
-void add_log(MOBA* env, int radiant_victory, int dire_victory) {
+void add_log(MOBA_MO* env, int radiant_victory, int dire_victory) {
     Log* log = &env->log;
     log->n += 1;
     log->score += radiant_victory;
@@ -420,11 +431,9 @@ void add_log(MOBA* env, int radiant_victory, int dire_victory) {
 
     PlayerLog* radiant_support = &env->player_logs[0];
     log->radiant_support_episode_return = radiant_support->episode_return;
+    log->radiant_support_scalarized_episode_return = radiant_support->scalarized_episode_return;
     log->radiant_support_discounted_episode_return = radiant_support->discounted_episode_return;
-    log->radiant_support_reward_death = radiant_support->reward_death;
-    log->radiant_support_reward_xp = radiant_support->reward_xp;
-    log->radiant_support_reward_distance = radiant_support->reward_distance;
-    log->radiant_support_reward_tower = radiant_support->reward_tower;
+    log->radiant_support_discounted_scalarized_episode_return = radiant_support->discounted_scalarized_episode_return;
     log->radiant_support_level = radiant_support->level;
     log->radiant_support_kills = radiant_support->kills;
     log->radiant_support_deaths = radiant_support->deaths;
@@ -439,19 +448,25 @@ void add_log(MOBA* env, int radiant_victory, int dire_victory) {
     log->radiant_support_usage_q = radiant_support->usage_q;
     log->radiant_support_usage_w = radiant_support->usage_w;
     log->radiant_support_usage_e = radiant_support->usage_e;
+
+    log->weight_death = env->weights[0];
+    log->weight_xp = env->weights[1];
+    log->weight_tower = env->weights[2];
 }
  
-void c_close(MOBA* env) {
+void c_close(MOBA_MO* env) {
     free(env->reward_components);
     free(env->map->grid);
     free(env->map);
     free(env->orig_grid);
     free(env->rng->rng);
     free(env->rng);
+    gsl_rng_free(env->gsl_rng);
 }
 
-void free_allocated_moba(MOBA* env) {
+void free_allocated_moba(MOBA_MO* env) {
     free(env->rewards);
+    free(env->weights);
     free(env->map->pids);
     free(env->ai_path_buffer);
     free(env->ai_paths);
@@ -463,14 +478,14 @@ void free_allocated_moba(MOBA* env) {
     c_close(env);
 }
 
-void compute_observations(MOBA* env) {
+void compute_observations(MOBA_MO* env) {
     int agents = (env->script_opponents) ? NUM_PLAYERS/2 : NUM_PLAYERS;
-    memset(env->observations, 0, agents*(11*11*4 + 26)*sizeof(unsigned char));
+    memset(env->observations, 0, agents*(11*11*4 + 25)*sizeof(unsigned char));
 
     int vis = env->vision_range;
     Map* map = env->map;
 
-    unsigned char (*observations)[11*11*4 + 26] = (unsigned char(*)[11*11*4 + 26])env->observations;
+    unsigned char (*observations)[11*11*4 + 25] = (unsigned char(*)[11*11*4 + 25])env->observations;
     for (int pid = 0; pid < agents; pid++) {
         // Does this copy?
         unsigned char* obs_map = &observations[pid][0];
@@ -505,8 +520,7 @@ void compute_observations(MOBA* env) {
         // Assumes scaled between -1 and 1, else overflows
         obs_extra[22] = (reward->death == 0) ? 0 : 255;
         obs_extra[23] = (reward->xp == 0) ? 0 : 255;
-        obs_extra[24] = (reward->distance == 0) ? 0 : 255;
-        obs_extra[25] = (reward->tower == 0) ? 0 : 255;
+        obs_extra[24] = (reward->tower == 0) ? 0 : 255;
 
         for (int dy = -vis; dy <= vis; dy++) {
             for (int dx = -vis; dx <= vis; dx++) {
@@ -551,7 +565,7 @@ static inline float l1_distance(float x1, float y1, float x2, float y2) {
 }
 
 // TODO: Should not take entire moba. Rename to min_greater_than or similar
-int calc_level(MOBA* env, int xp) {
+int calc_level(MOBA_MO* env, int xp) {
     int i;
     for (i = 0; i < 30; i++) {
         if (xp < XP_FOR_LEVEL[i])
@@ -560,7 +574,7 @@ int calc_level(MOBA* env, int xp) {
     return i;
 }
 
-Reward* get_reward(MOBA* env, int pid) {
+Reward* get_reward(MOBA_MO* env, int pid) {
     return &env->reward_components[pid];
 }
 
@@ -601,7 +615,7 @@ int move_near(Map* map, Entity* entity, Entity* target) {
     return 1;
 }
 
-int move_towards(MOBA* env, Entity* entity, int y_dst, int x_dst, float speed) {
+int move_towards(MOBA_MO* env, Entity* entity, int y_dst, int x_dst, float speed) {
     int y_src = entity->y;
     int x_src = entity->x;
 
@@ -685,7 +699,7 @@ void spawn_player(Map* map, Entity* entity) {
     }
 }
 
-int attack(MOBA* env, Entity* player, Entity* target, float damage) {
+int attack(MOBA_MO* env, Entity* player, Entity* target, float damage) {
     if (target->pid == -1 || target->team == player->team)
         return 1;
 
@@ -728,7 +742,6 @@ int attack(MOBA* env, Entity* player, Entity* target, float damage) {
     int target_type = target->entity_type;
     if (target_type == ENTITY_PLAYER) {
         env->reward_components[target->pid].death = env->reward_death;
-        target_log->reward_death = env->reward_death;
         player_log->kills += 1;
         target_log->deaths += 1;
         spawn_player(env->map, target);
@@ -806,7 +819,7 @@ int attack(MOBA* env, Entity* player, Entity* target, float damage) {
     return 0;
 }
 
-int basic_attack(MOBA* env, Entity* player, Entity* target) {
+int basic_attack(MOBA_MO* env, Entity* player, Entity* target) {
     if (player->basic_attack_timer > 0)
         return 1;
 
@@ -814,7 +827,7 @@ int basic_attack(MOBA* env, Entity* player, Entity* target) {
     return attack(env, player, target, player->damage);
 }
 
-int heal(MOBA* env, Entity* player, Entity* target, float amount) {
+int heal(MOBA_MO* env, Entity* player, Entity* target, float amount) {
     if (target->pid == -1 || target->team != player->team)
         return 1;
 
@@ -838,7 +851,7 @@ int heal(MOBA* env, Entity* player, Entity* target, float amount) {
     return 0;
 }
 
-int spawn_creep(MOBA* env, int idx, int lane) {
+int spawn_creep(MOBA_MO* env, int idx, int lane) {
     int pid = CREEP_OFFSET + idx;
     Entity* creep = &env->entities[pid];
 
@@ -880,7 +893,7 @@ int spawn_creep(MOBA* env, int idx, int lane) {
     return move_to(env->map, creep, y, x);
 }
 
-int spawn_neutral(MOBA* env, int idx) {
+int spawn_neutral(MOBA_MO* env, int idx) {
     int pid = NEUTRAL_OFFSET + idx;
     Entity* neutral = &env->entities[pid];
     neutral->pid = pid;
@@ -921,7 +934,7 @@ int spawn_at(Map* map, Entity* entity, float y, float x) {
     return 0;
 }
 
-int scan_aoe(MOBA* env, Entity* player, int radius,
+int scan_aoe(MOBA_MO* env, Entity* player, int radius,
         bool exclude_friendly, bool exclude_hostile, bool exclude_creeps,
         bool exclude_neutrals, bool exclude_towers) {
 
@@ -979,7 +992,7 @@ int scan_aoe(MOBA* env, Entity* player, int radius,
     return (idx == 0) ? 1 : 0;
 }
 
-Entity* nearest_scanned_target(MOBA* env, Entity* player){
+Entity* nearest_scanned_target(MOBA_MO* env, Entity* player){
     Entity* nearest_target = NULL;
     float nearest_dist = 9999999;
     float player_y = player->y;
@@ -1001,7 +1014,7 @@ Entity* nearest_scanned_target(MOBA* env, Entity* player){
     return nearest_target;
 }
 
-void aoe_scanned(MOBA* env, Entity* player, Entity* target, float damage, int stun) {
+void aoe_scanned(MOBA_MO* env, Entity* player, Entity* target, float damage, int stun) {
     int pid = player->pid;
     for (int idx = 0; idx < 121; idx++) {
         Entity* target = env->scanned_targets[pid][idx];
@@ -1021,7 +1034,7 @@ void aoe_scanned(MOBA* env, Entity* player, Entity* target, float damage, int st
     }
 }
 
-int player_aoe_attack(MOBA* env, Entity* player,
+int player_aoe_attack(MOBA_MO* env, Entity* player,
         Entity* target, int radius, float damage, int stun) {
     bool exclude_hostile = damage < 0;
     bool exclude_friendly = !exclude_hostile;
@@ -1038,7 +1051,7 @@ int player_aoe_attack(MOBA* env, Entity* player,
     return 0;
 }
 
-int push(MOBA* env, Entity* player, Entity* target, float amount) {
+int push(MOBA_MO* env, Entity* player, Entity* target, float amount) {
     float dx = target->x - player->x;
     float dy = target->y - player->y;
     float dist = fabs(dx) + fabs(dy);
@@ -1052,11 +1065,11 @@ int push(MOBA* env, Entity* player, Entity* target, float amount) {
     return move_to(env->map, target, target->y + dy, target->x + dx);
 }
 
-int pull(MOBA* env, Entity* player, Entity* target, float amount) {
+int pull(MOBA_MO* env, Entity* player, Entity* target, float amount) {
     return push(env, player, target, -amount);
 }
 
-int aoe_pull(MOBA* env, Entity* player, int radius, float amount) {
+int aoe_pull(MOBA_MO* env, Entity* player, int radius, float amount) {
     scan_aoe(env, player, radius, true, false, false, false, true);
     int err = 1;
     int pid = player->pid;
@@ -1071,7 +1084,7 @@ int aoe_pull(MOBA* env, Entity* player, int radius, float amount) {
     return err;
 }
 
-void creep_ai(MOBA* env, Entity* creep) {
+void creep_ai(MOBA_MO* env, Entity* creep) {
     int waypoint = creep->waypoint;
     int lane = creep->lane;
     int pid = creep->pid;
@@ -1101,7 +1114,7 @@ void creep_ai(MOBA* env, Entity* creep) {
     }
 }
 
-void neutral_ai(MOBA* env, Entity* neutral) {
+void neutral_ai(MOBA_MO* env, Entity* neutral) {
     if (env->tick % 5 == 0) {
         scan_aoe(env, neutral, NEUTRAL_VISION, true, false, true, true, true);
     }
@@ -1120,7 +1133,7 @@ void neutral_ai(MOBA* env, Entity* neutral) {
     }
 }
 
-void randomize_tower_hp(MOBA* env) {
+void randomize_tower_hp(MOBA_MO* env) {
     for (int i = 0; i < NUM_TOWERS; i++) {
         int pid = TOWER_OFFSET + i;
         Entity* tower = &env->entities[pid];
@@ -1154,7 +1167,7 @@ void update_cooldowns(Entity* entity) {
 }
 
 // TODO: Fix
-int skill_support_hook(MOBA* env, Entity* player, Entity* target) {
+int skill_support_hook(MOBA_MO* env, Entity* player, Entity* target) {
     int mana_cost = 100;
     if (target == NULL || player->mana < mana_cost)
         return 1;
@@ -1165,7 +1178,7 @@ int skill_support_hook(MOBA* env, Entity* player, Entity* target) {
     return 0;
 }
 
-int skill_support_aoe_heal(MOBA* env, Entity* player, Entity* target) {
+int skill_support_aoe_heal(MOBA_MO* env, Entity* player, Entity* target) {
     int mana_cost = 100;
     if (player->mana < mana_cost)
         return 1;
@@ -1178,7 +1191,7 @@ int skill_support_aoe_heal(MOBA* env, Entity* player, Entity* target) {
     return 1;
 }
 
-int skill_support_stun(MOBA* env, Entity* player, Entity* target) {
+int skill_support_stun(MOBA_MO* env, Entity* player, Entity* target) {
     int mana_cost = 75;
     if (target == NULL || player->mana < mana_cost)
         return 1;
@@ -1192,7 +1205,7 @@ int skill_support_stun(MOBA* env, Entity* player, Entity* target) {
     return 1;
 }
 
-int skill_assassin_aoe_minions(MOBA* env, Entity* player, Entity* target) {
+int skill_assassin_aoe_minions(MOBA_MO* env, Entity* player, Entity* target) {
     int mana_cost = 100;
     if (target == NULL || player->mana < mana_cost)
         return 1;
@@ -1209,7 +1222,7 @@ int skill_assassin_aoe_minions(MOBA* env, Entity* player, Entity* target) {
     return 1;
 }
 
-int skill_assassin_tp_damage(MOBA* env, Entity* player, Entity* target) {
+int skill_assassin_tp_damage(MOBA_MO* env, Entity* player, Entity* target) {
     int mana_cost = 150;
     if (target == NULL || player->mana < mana_cost)
         return 1;
@@ -1226,7 +1239,7 @@ int skill_assassin_tp_damage(MOBA* env, Entity* player, Entity* target) {
     return 1;
 }
 
-int skill_assassin_move_buff(MOBA* env, Entity* player, Entity* target) {
+int skill_assassin_move_buff(MOBA_MO* env, Entity* player, Entity* target) {
     int mana_cost = 100;
     if (player->mana < mana_cost)
         return 1;
@@ -1238,7 +1251,7 @@ int skill_assassin_move_buff(MOBA* env, Entity* player, Entity* target) {
     return 0;
 }
 
-int skill_burst_nuke(MOBA* env, Entity* player, Entity* target) {
+int skill_burst_nuke(MOBA_MO* env, Entity* player, Entity* target) {
     int mana_cost = 200;
     if (target == NULL || player->mana < mana_cost)
         return 1;
@@ -1251,7 +1264,7 @@ int skill_burst_nuke(MOBA* env, Entity* player, Entity* target) {
     return 1;
 }
 
-int skill_burst_aoe(MOBA* env, Entity* player, Entity* target) {
+int skill_burst_aoe(MOBA_MO* env, Entity* player, Entity* target) {
     int mana_cost = 100;
     if (target == NULL || player->mana < mana_cost)
         return 1;
@@ -1264,7 +1277,7 @@ int skill_burst_aoe(MOBA* env, Entity* player, Entity* target) {
     return 1;
 }
 
-int skill_burst_aoe_stun(MOBA* env, Entity* player, Entity* target) {
+int skill_burst_aoe_stun(MOBA_MO* env, Entity* player, Entity* target) {
     int mana_cost = 75;
     if (target == NULL || player->mana < mana_cost)
         return 1;
@@ -1277,7 +1290,7 @@ int skill_burst_aoe_stun(MOBA* env, Entity* player, Entity* target) {
     return 1;
 }
 
-int skill_tank_aoe_dot(MOBA* env, Entity* player, Entity* target) {
+int skill_tank_aoe_dot(MOBA_MO* env, Entity* player, Entity* target) {
     int mana_cost = 5;
     if (player->mana < mana_cost)
         return 1;
@@ -1290,7 +1303,7 @@ int skill_tank_aoe_dot(MOBA* env, Entity* player, Entity* target) {
 }
 
 // TODO: Fix
-int skill_tank_self_heal(MOBA* env, Entity* player, Entity* target) {
+int skill_tank_self_heal(MOBA_MO* env, Entity* player, Entity* target) {
     int mana_cost = 100;
     if (player->mana < mana_cost)
         return 1;
@@ -1304,7 +1317,7 @@ int skill_tank_self_heal(MOBA* env, Entity* player, Entity* target) {
 }
 
 //Engages but doesnt push
-int skill_tank_engage_aoe(MOBA* env, Entity* player, Entity* target) {
+int skill_tank_engage_aoe(MOBA_MO* env, Entity* player, Entity* target) {
     int mana_cost = 50;
     if (target == NULL || player->mana < mana_cost)
         return 1;
@@ -1318,7 +1331,7 @@ int skill_tank_engage_aoe(MOBA* env, Entity* player, Entity* target) {
     return 1;
 }
 
-int skill_carry_retreat_slow(MOBA* env, Entity* player, Entity* target) {
+int skill_carry_retreat_slow(MOBA_MO* env, Entity* player, Entity* target) {
     int mana_cost = 25;
     if (target == NULL || player->mana < mana_cost)
         return 1;
@@ -1339,7 +1352,7 @@ int skill_carry_retreat_slow(MOBA* env, Entity* player, Entity* target) {
     return err;
 }
 
-int skill_carry_slow_damage(MOBA* env, Entity* player, Entity* target) {
+int skill_carry_slow_damage(MOBA_MO* env, Entity* player, Entity* target) {
     int mana_cost = 150;
     if (target == NULL || player->mana < mana_cost)
         return 1;
@@ -1354,7 +1367,7 @@ int skill_carry_slow_damage(MOBA* env, Entity* player, Entity* target) {
     return 1;
 }
 
-int skill_carry_aoe(MOBA* env, Entity* player, Entity* target) {
+int skill_carry_aoe(MOBA_MO* env, Entity* player, Entity* target) {
     int mana_cost = 100;
     if (target == NULL || player->mana < mana_cost)
         return 1;
@@ -1367,7 +1380,7 @@ int skill_carry_aoe(MOBA* env, Entity* player, Entity* target) {
     return 1;
 }
 
-void step_creeps(MOBA* env) {
+void step_creeps(MOBA_MO* env) {
     // Spawn wave
     if (env->tick % 150 == 0) {
         for (int lane = 0; lane < 6; lane++) {
@@ -1394,7 +1407,7 @@ void step_creeps(MOBA* env) {
     }
 }
 
-void step_neutrals(MOBA* env) {
+void step_neutrals(MOBA_MO* env) {
     if (env->tick % 600 == 0) {
         for (int camp = 0; camp < 18; camp++) {
             for (int neut = 0; neut < 4; neut++) {
@@ -1417,7 +1430,7 @@ void step_neutrals(MOBA* env) {
     }
 }
 
-void step_towers(MOBA* env) {
+void step_towers(MOBA_MO* env) {
     for (int idx = 0; idx < NUM_TOWERS; idx++) {
         int pid = TOWER_OFFSET + idx;
         Entity* tower = &env->entities[pid];
@@ -1453,7 +1466,7 @@ void step_towers(MOBA* env) {
     }
 }
 
-void clear_player_rewards(MOBA* env) {
+void clear_player_rewards(MOBA_MO* env) {
     for (int pid = 0; pid < NUM_PLAYERS; pid++) {
         Reward* reward = &env->reward_components[pid];
         reward->death = 0;
@@ -1462,7 +1475,7 @@ void clear_player_rewards(MOBA* env) {
     }
 }
 
-void step_players(MOBA* env) {
+void step_players(MOBA_MO* env) {
     for (int pid = 0; pid < NUM_PLAYERS; pid++) {
         Entity* player = &env->entities[pid];
         PlayerLog* log = &env->player_logs[pid];
@@ -1552,33 +1565,43 @@ void step_players(MOBA* env) {
         }
 
         float sum_reward = (
-            reward->death +
+            // Non-scalarized returns ignore death rewards to mimick the original environment default zero value
             reward->xp +
-            reward->distance +
             reward->tower
         );
 
-        env->player_logs[pid].reward_death = reward->death;
-        env->player_logs[pid].reward_xp = reward->xp;
-        env->player_logs[pid].reward_distance = reward->distance;
-        env->player_logs[pid].reward_tower = reward->tower;
+        // Scalarize using this players' weights
+        float weight_death = env->weights[pid * REWARD_DIM + 0];
+        float weight_xp = env->weights[pid * REWARD_DIM + 1];
+        float weight_tower = env->weights[pid * REWARD_DIM + 2];
+
+        float scalarized_reward = (
+            reward->death * weight_death +
+            reward->xp * weight_xp +
+            reward->tower * weight_tower
+        );
+
+        env->player_logs[pid].scalarized_episode_return += scalarized_reward;
+        env->player_logs[pid].discounted_scalarized_episode_return += env->gamma_t * scalarized_reward;
         env->player_logs[pid].episode_return += sum_reward;
         env->player_logs[pid].discounted_episode_return += env->gamma_t * sum_reward;
 
-        // printf("env->reward_death: %f\n", env->reward_death);
-        // printf("reward_death: %f\n", reward->death);
         if (!env->script_opponents || pid < 5) {
             env->log.episode_return_death += reward->death; 
             env->log.episode_return_xp += reward->xp; 
             env->log.episode_return_tower += reward->tower; 
+            env->log.scalarized_episode_return += scalarized_reward;
             env->log.episode_return += sum_reward;
 
             env->log.discounted_episode_return_death += env->gamma_t * reward->death;
             env->log.discounted_episode_return_xp += env->gamma_t * reward->xp;
             env->log.discounted_episode_return_tower += env->gamma_t * reward->tower;
+            env->log.discounted_scalarized_episode_return += env->gamma_t * scalarized_reward;
             env->log.discounted_episode_return += env->gamma_t * sum_reward;
 
-            env->rewards[pid] = sum_reward;
+            env->rewards[pid * REWARD_DIM + 0] = reward->death;
+            env->rewards[pid * REWARD_DIM + 1] = reward->xp;
+            env->rewards[pid * REWARD_DIM + 2] = reward->tower;
         }
     }
 }
@@ -1610,13 +1633,20 @@ unsigned char* read_file(char* filename) {
     return array;
 }
 
-void init_moba(MOBA* env, unsigned char* game_map_npy) {
+void init_moba(MOBA_MO* env, unsigned char* game_map_npy) {
     env->obs_size = 2*env->vision_range + 1;
     env->creep_idx = 0;
     env->total_towers_taken = 0;
     env->total_levels_gained = 0;
     env->radiant_victories = 0;
     env->dire_victories = 0;
+    env->manual_weights = false;
+
+    // Initialize GSL RNG if not already initialized
+    if (env->gsl_rng == NULL) {
+        env->gsl_rng = gsl_rng_alloc(gsl_rng_default);
+        gsl_rng_set(env->gsl_rng, time(NULL));
+    }
 
     env->entities = calloc(NUM_ENTITIES, sizeof(Entity));
     env->reward_components = calloc(NUM_PLAYERS, sizeof(Reward));
@@ -1814,12 +1844,13 @@ void init_moba(MOBA* env, unsigned char* game_map_npy) {
     }
 }
 
-MOBA* allocate_moba(MOBA* env) {
+MOBA_MO* allocate_moba(MOBA_MO* env) {
     // TODO: Don't hardcode sizes
     int agents = (env->script_opponents) ? NUM_PLAYERS/2 : NUM_PLAYERS;
-    env->observations = calloc(agents*(11*11*4 + 26), sizeof(unsigned char));
+    env->observations = calloc(agents*(11*11*4 + 25), sizeof(unsigned char));
     env->actions = calloc(agents*6, sizeof(int));
-    env->rewards = calloc(agents, sizeof(float));
+    env->rewards = calloc(agents * REWARD_DIM, sizeof(float));
+    env->weights = calloc(agents * REWARD_DIM, sizeof(float));
     env->terminals = calloc(agents, sizeof(unsigned char));
     env->truncations = calloc(agents, sizeof(unsigned char));
     env->done = false;
@@ -1836,7 +1867,7 @@ MOBA* allocate_moba(MOBA* env) {
     return env;
 }
 
-void c_reset(MOBA* env) {
+void c_reset(MOBA_MO* env) {
     if (env->freeze_on_done && env->done) {
         return;
     }
@@ -1847,10 +1878,12 @@ void c_reset(MOBA* env) {
     env->tick = 0;
     env->gamma_t = env->gamma;
     env->log.episode_return = 0;
+    env->log.scalarized_episode_return = 0;
     env->log.episode_return_death = 0;
     env->log.episode_return_xp = 0;
     env->log.episode_return_tower = 0;
     env->log.discounted_episode_return = 0;
+    env->log.discounted_scalarized_episode_return = 0;
     env->log.discounted_episode_return_death = 0;
     env->log.discounted_episode_return_xp = 0;
     env->log.discounted_episode_return_tower = 0;
@@ -1917,9 +1950,24 @@ void c_reset(MOBA* env) {
     }
 
     compute_observations(env);
+
+    // Sample new reward weights for each episode (unless manually set)
+    if (env->manual_weights) {
+        return;
+    }
+    
+    int num_agents = env->script_opponents ? NUM_PLAYERS/2 : NUM_PLAYERS;
+    // Sample once and assign same weights to all agents
+    double shared_weight_buffer[REWARD_DIM];
+    gsl_ran_dirichlet(env->gsl_rng, REWARD_DIM, dirichlet_alpha, shared_weight_buffer);
+    for (int j = 0; j < num_agents; j++) {
+        for (int i = 0; i < REWARD_DIM; i++) {
+            env->weights[j * REWARD_DIM + i] = (float)shared_weight_buffer[i];
+        }
+    }
 }
 
-void c_step(MOBA* env) {
+void c_step(MOBA_MO* env) {
     if (env->freeze_on_done && env->done) {
         return;
     }
@@ -2058,7 +2106,7 @@ MapRenderer* init_map_renderer(int cell_size, int width, int height) {
     renderer->cell_size = cell_size;
     renderer->width = width;
     renderer->height = height;
-    InitWindow(width*cell_size, height*cell_size, "Puffer MOBA");
+    InitWindow(width*cell_size, height*cell_size, "Puffer MOBA_MO");
     SetTargetFPS(10);
     return renderer;
 }
@@ -2068,7 +2116,7 @@ void close_map_renderer(MapRenderer* renderer) {
     free(renderer);
 }
 
-void render_map(MapRenderer* renderer, MOBA* env) {
+void render_map(MapRenderer* renderer, MOBA_MO* env) {
     BeginDrawing();
     ClearBackground(COLORS[0]);
     int sz = renderer->cell_size;
@@ -2080,7 +2128,7 @@ void render_map(MapRenderer* renderer, MOBA* env) {
                 DrawRectangle(x*sz, y*sz, sz, sz, COLORS[tile]);
         }
     }
-    DrawText("Reinforcement learned MOBA agents running in your browswer!", 10, 10, 20, COLORS[8]);
+    DrawText("Reinforcement learned MOBA_MO agents running in your browswer!", 10, 10, 20, COLORS[8]);
     DrawText("Written in pure C by @jsuarez5341. Star it on GitHub/pufferai/pufferlib to support my work!", 10, 40, 20, COLORS[8]);
     EndDrawing();
 }
@@ -2124,7 +2172,7 @@ GameRenderer* init_game_renderer(int cell_size, int width, int height) {
     renderer->width = width;
     renderer->height = height;
 
-    InitWindow(width*cell_size, height*cell_size, "Puffer MOBA");
+    InitWindow(width*cell_size, height*cell_size, "Puffer MOBA_MO");
     SetTargetFPS(60);
 
     Rectangle asset_map[] = {
@@ -2217,7 +2265,7 @@ void draw_bars(Entity* entity, int x, int y, int width, int height, bool draw_te
     }
 }
 
-int c_render(MOBA* env) {
+int c_render(MOBA_MO* env) {
     if (env->client == NULL) {
         env->client = init_game_renderer(32, 41, 23);
     }
