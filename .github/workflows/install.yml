@@ -25,6 +25,20 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
+      - name: Install GSL (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get install -y libgsl-dev
+
+      - name: Install GSL (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install gsl
+          GSL_PREFIX="$(brew --prefix gsl)"
+          echo "LDFLAGS=-L${GSL_PREFIX}/lib" >> $GITHUB_ENV
+          echo "CPPFLAGS=-I${GSL_PREFIX}/include" >> $GITHUB_ENV
+          echo "LIBRARY_PATH=${GSL_PREFIX}/lib" >> $GITHUB_ENV
+          echo "CPATH=${GSL_PREFIX}/include" >> $GITHUB_ENV
+
       - name: Setup Conda
         if: matrix.env == 'conda'
         uses: conda-incubator/setup-miniconda@v2
