@@ -1,56 +1,160 @@
 
-> **⚠️ Fork notice**: This is a fork of [PufferLib](https://github.com/PufferAI/PufferLib/tree/3.0)
-> with algorithmic and environment extensions for multi-objective reinforcement learning (MORL).
-> This work is part of the paper "Controllability in preference-conditioned multi-objective reinforcement learning", currently under review at NeuS 2026.
+# PufferMO
 
-## Key differences from PufferLib
+**PufferMO** is a performant framework for multi-objective reinforcement learning (MORL), built as an extension of [PufferLib 3.0](https://github.com/PufferAI/PufferLib/tree/3.0). It provides three multi-objective environment variants, a vectorized reward interface, and support for weight-conditioned Multi-Objective PPO (MOPPO).
 
-### Algorithmic extensions
-
-- **Weight Conditioning**: Policy networks conditioned on preference weights via Dirichlet sampling
-- **Multi-Objective PPO (MOPPO)**: Extended PPO to handle vector rewards with preference weight conditioning
-
-### Environment extensions
-
-- **Multi-objective environment variants**: `snake_mo`, `moba_mo`, `tetris_mo` with vectorized rewards
-- **Reward decomposition**: Separate reward components (e.g., food/corpse/death in Snake, death/xp/distance/tower in MOBA)
-
-### Experiments
-
-Experiments on dynamic adaptation were performed using the default evaluation command in PufferLib on `tetris_mo` while recording the virtual environment screen using script `./record.sh`, e.g.:
-
-```bash
-./record.sh tetris.mp4 puffer eval puffer_tetris_mo --wandb --load-id <wandb-load-id>  # for MOPPO
-```
-
-Experiments on static adaptation were run on three environments
-comparing non-conditioned baselines (PPO, MOPPO without conditioning)
-against the weight-conditioned MOPPO.
-Evaluation used 30 randomly sampled preference vectors per each of the two best models per environment and algorithm.
-See [run_adaptation_experiment.py](run_adaptation_experiment.py) for details.
+> This work accompanies the paper **"Controllability in preference-conditioned multi-objective reinforcement learning"**, accepted at NeuS 2026.
 
 ---
 
-![figure](https://pufferai.github.io/source/resource/header.png)
+## Contents
 
-[![PyPI version](https://badge.fury.io/py/pufferlib.svg)](https://badge.fury.io/py/pufferlib)
-![PyPI - Python Version](https://img.shields.io/pypi/pyversions/pufferlib)
-![Github Actions](https://github.com/PufferAI/PufferLib/actions/workflows/install.yml/badge.svg)
-[![](https://dcbadge.vercel.app/api/server/spT4huaGYV?style=plastic)](https://discord.gg/spT4huaGYV)
-[![Twitter](https://img.shields.io/twitter/url/https/twitter.com/cloudposse.svg?style=social&label=Follow%20%40jsuarez5341)](https://twitter.com/jsuarez5341)
+- [What is PufferMO?](#what-is-pufferMO)
+- [Setup and Usage](#setup-and-usage)
+- [MOPPO and Linear Preference](#moppo-and-linear-preference)
+- [Reproducing Paper Experiments](#reproducing-paper-experiments)
+- [Citation](#citation)
 
-PufferLib is the reinforcement learning library I wish existed during my PhD. It started as a compatibility layer to make working with complex environments a breeze. Now, it's a high-performance toolkit for research and industry with optimized parallel simulation, environments that run and train at 1M+ steps/second, and tons of quality of life improvements for practitioners. All our tools are free and open source. We also offer priority service for companies, startups, and labs!
+---
 
-![Trailer](https://github.com/PufferAI/puffer.ai/blob/main/docs/assets/puffer_2.gif?raw=true)
+## What is PufferMO?
 
-All of our documentation is hosted at [puffer.ai](https://puffer.ai "PufferLib Documentation"). @jsuarez5341 on [Discord](https://discord.gg/puffer) for support -- post here before opening issues. We're always looking for new contributors, too!
+PufferMO extends PufferLib 3.0 with the following additions:
 
-## Star to puff up the project!
+**Environments** — Three multi-objective variants of PufferLib's built-in environments, each exposing a decomposed vector reward instead of a scalar:
 
-<a href="https://star-history.com/#pufferai/pufferlib&Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=pufferai/pufferlib&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=pufferai/pufferlib&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=pufferai/pufferlib&type=Date" />
- </picture>
-</a>
+| Environment | Reward components |
+|---|---|
+| `puffer_tetris_mo` | drop, rotate, combo |
+| `puffer_snake_mo` | food, corpse, death |
+| `puffer_moba_mo` | death, distance, tower |
+
+The original scalar-reward environments (`puffer_tetris`, `puffer_snake`, `puffer_moba`) remain available as baselines.
+
+**Algorithm** — Multi-Objective PPO (MOPPO), which extends standard PPO with:
+- A vectorized critic that operates on the reward vector
+- Optional preference weight conditioning: the policy network receives a preference weight vector $\mathbf{w}$ as input alongside the observation
+
+---
+
+## Setup and Usage
+
+**Install**
+
+```bash
+uv venv
+uv pip install -e .
+source .venv/bin/activate
+
+# Compile C environments after installation or any changes to C code
+python setup.py build_ext --inplace --force
+```
+
+**Evaluate (random policy)**
+
+```bash
+puffer eval puffer_tetris_mo
+puffer eval puffer_tetris_mo --train.device cpu --vec.overwork True  # CPU fallback
+```
+
+**Train**
+
+```bash
+# MOPPO without weight conditioning
+puffer train puffer_tetris_mo
+
+# MOPPO with weight conditioning, logging to wandb
+puffer train puffer_tetris_mo --policy.weight-conditioning True --wandb
+
+# See all options (default values found in <env_name>.ini and default.ini)
+puffer train puffer_tetris_mo --help
+```
+
+**Evaluate a trained model**
+
+```bash
+puffer eval puffer_tetris_mo --load-model-path latest
+puffer eval puffer_tetris_mo --wandb --load-id <wandb-run-id>
+puffer eval puffer_tetris_mo --env.max-ticks 1000
+```
+
+---
+
+## MOPPO and Linear Preference
+
+### Reward decomposition
+
+The multi-objective environments expose a reward vector rather than a scalar. For example, Tetris goes from:
+
+$$r = r_\text{drop} + r_\text{rotate} + r_\text{combo}$$
+
+to:
+
+$$\mathbf{r} = \left[r_\text{drop},\ r_\text{rotate},\ r_\text{combo}\right]$$
+
+### Linear preference
+
+A preference is a weight vector $\mathbf{w}$ on the simplex ($w_i \geq 0$, $\sum_i w_i = 1$) that linearly combines reward components into a scalar utility:
+
+$$u = \mathbf{w} \cdot \mathbf{r} = w_\text{drop} \cdot r_\text{drop} + w_\text{rotate} \cdot r_\text{rotate} + w_\text{combo} \cdot r_\text{combo}$$
+
+![The linear preference simplex for Tetris](readme/simplex_tetris.png)
+
+### Algorithm
+
+MOPPO samples $\mathbf{w}$ from a Dirichlet distribution at each rollout, concatenates it with the policy's observation input (when weight conditioning is enabled), and uses the vectorized critic to compute per-component advantages before scalarizing via $\mathbf{w}$.
+
+![Extending PPO to MOPPO](readme/ppo_to_moppo.png)
+
+---
+
+## Reproducing Paper Experiments
+
+Experiments compare three algorithms across all three environments:
+
+| Algorithm | Description |
+|---|---|
+| PPO | Standard PPO on scalar-reward environment |
+| MOPPO (no cond.) | MOPPO with vector rewards, no weight conditioning |
+| MOPPO | MOPPO with weight conditioning (Dirichlet-sampled $\mathbf{w}$) |
+
+### Static adaptation
+
+Preference weights are fixed for the duration of each episode. Evaluation used 30 uniformly spaced preference vectors per model, with the two best-performing checkpoints per environment and algorithm. See [`run_adaptation_experiment.py`](run_adaptation_experiment.py) for the full evaluation script.
+
+### Dynamic adaptation
+
+Preference weights change during an episode according to a user-specified schedule. The model is expected to adapt its behavior on the fly.
+
+![Dynamic adaptation](readme/dynamic_adaptation.png)
+
+To run dynamic adaptation evaluation (and record a video):
+
+```bash
+./record.sh tetris.mp4 puffer eval puffer_tetris_mo \
+  --policy.weight-conditioning True \
+  --wandb \
+  --load-id <wandb-run-id> \
+  --env.max-ticks 1000 \
+  --eval-weights "{0: [0.5, 0.5, 0], 500: [0, 0, 1]}"
+```
+
+The `--eval-weights` argument takes a dictionary mapping tick offsets to weight vectors, allowing arbitrary preference schedules within a single episode.
+
+---
+
+## Citation
+
+If you use PufferMO in your research, please cite:
+
+```bibtex
+@inproceedings{delasherasmolins:2026,
+  title     = {Controllability in preference-conditioned multi-objective reinforcement learning},
+  author    = {P. de las Heras Molins and B. Yalcinkaya and L. Peters and D. Fridovich-Keil and G. Bakirtzis},
+  year      = {2026},
+  booktitle = {NeuS},
+  note      = {In press}
+}
+```
+
+

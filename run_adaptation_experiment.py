@@ -122,9 +122,9 @@ def adaptation_experiment(env_name):
             for run_idx in range(NUM_EVAL_WEIGHTS):
                 additional_run_args = []
                 if weight_conditioning:
-                    weight_str = ",".join(
+                    weight_str = '"[' + ",".join(
                         [f"{w:.6f}" for w in eval_weights[run_idx]] # type: ignore
-                    )
+                    ) + ']"'
                     additional_run_args += ["--eval-weights", weight_str]
 
                 # Call puffer eval via subprocess to avoid memory leaks

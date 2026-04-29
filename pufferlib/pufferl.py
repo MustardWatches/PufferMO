@@ -1247,11 +1247,18 @@ def eval(env_name, args=None, vecenv=None, policy=None):
     eval_weight_schedule = None
     if multiobjective_reward:
         if args['eval_weights']:
-            eval_weight_schedule = {
-                0: np.array([float(w) for w in args['eval_weights'].split(',')]),
-            }
-        if not eval_weight_schedule:
-            # Randomly sample weight
+            value = ast.literal_eval(args['eval_weights'])
+            if isinstance(value, list):
+                eval_weight_schedule = {
+                    0: value
+                }
+            elif isinstance(value, dict):
+                eval_weight_schedule = {0: [0] * reward_dim}
+                eval_weight_schedule.update(value)
+            else:
+                raise ValueError('eval_weights must be a valid list or dict')
+        else:
+            # Randomly sample weights
             eval_weight_schedule = {
                 0: rng.dirichlet(np.ones(reward_dim)),
             }
@@ -1260,7 +1267,7 @@ def eval(env_name, args=None, vecenv=None, policy=None):
     eval_weights = get_weight_from_schedule(eval_weight_schedule, device=device)
 
     if not multiobjective_reward:
-        eval_weights = None  # TODO PHM: Ignore eval_weights for now
+        eval_weights = None
     if eval_weights is not None and not multiobjective_reward:
         raise ValueError('eval_weights can only be used with multi-objective environments')
     if eval_weights is not None:
@@ -1278,6 +1285,7 @@ def eval(env_name, args=None, vecenv=None, policy=None):
 
     if eval_weights is not None:
         eval_weights = torch.as_tensor(eval_weights, dtype=torch.float32, device=device)
+        print(f'Initial eval weights: {eval_weights.cpu().numpy()}')
 
     tick = 0
     max_ticks = args['env']['max_ticks']
@@ -1287,8 +1295,9 @@ def eval(env_name, args=None, vecenv=None, policy=None):
             if len(eval_weight_schedule.keys()) > 1:  # No need to change weights if only one set of weights (static)
                 new_weights = get_weight_from_schedule(eval_weight_schedule, tick=tick, device=device)
                 if any(new_weights != eval_weights):
+                    print(f'Changing eval weights to {new_weights.cpu().numpy()} at tick {tick}')
                     eval_weights = new_weights
-                    # Reset RNN state when changing weights to reduce inertia
+                    # Reset RNN state when changing weights to reduce (not eliminate) inertia
                     if args['train']['use_rnn']:
                         state['lstm_h'] = torch.zeros(num_agents, policy.hidden_size, device=device)
                         state['lstm_c'] = torch.zeros(num_agents, policy.hidden_size, device=device)
