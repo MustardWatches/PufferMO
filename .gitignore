@@ -150,7 +150,9 @@ dmypy.json
 *.gb
 
 checkpoints/
-experiments/
+experiments/*
+!experiments/paper/
+experiments/paper/figures
 wandb/
 .neptune/
 raylib*/

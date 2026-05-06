@@ -9,10 +9,10 @@
 
 ## Contents
 
-- [What is PufferMO?](#what-is-pufferMO)
-- [Setup and Usage](#setup-and-usage)
-- [MOPPO and Linear Preference](#moppo-and-linear-preference)
-- [Reproducing Paper Experiments](#reproducing-paper-experiments)
+- [What is PufferMO?](#what-is-puffermo)
+- [Setup and usage](#setup-and-usage)
+- [MOPPO and linear preference](#moppo-and-linear-preference)
+- [Reproducing the experiments reported in the paper](#reproducing-the-experiments-reported-in-the-paper)
 - [Citation](#citation)
 
 ---
@@ -37,7 +37,7 @@ The original scalar-reward environments (`puffer_tetris`, `puffer_snake`, `puffe
 
 ---
 
-## Setup and Usage
+## Setup and usage
 
 **Install**
 
@@ -80,7 +80,7 @@ puffer eval puffer_tetris_mo --env.max-ticks 1000
 
 ---
 
-## MOPPO and Linear Preference
+## MOPPO and linear preference
 
 ### Reward decomposition
 
@@ -108,7 +108,7 @@ MOPPO samples $\mathbf{w}$ from a Dirichlet distribution at each rollout, concat
 
 ---
 
-## Reproducing Paper Experiments
+## Reproducing the experiments reported in the paper
 
 Experiments compare three algorithms across all three environments:
 
@@ -120,7 +120,7 @@ Experiments compare three algorithms across all three environments:
 
 ### Static adaptation
 
-Preference weights are fixed for the duration of each episode. Evaluation used 30 uniformly spaced preference vectors per model, with the two best-performing checkpoints per environment and algorithm. See [`run_adaptation_experiment.py`](run_adaptation_experiment.py) for the full evaluation script.
+Preference weights are fixed for the duration of each episode. Evaluation used 30 uniformly spaced preference vectors per model, with the two best-performing checkpoints per environment and algorithm. See [`run_static_adaptation_experiment.py`](experiments/paper/run_static_adaptation_experiment.py) for the full evaluation script.
 
 ### Dynamic adaptation
 
@@ -140,6 +140,19 @@ To run dynamic adaptation evaluation (and record a video):
 ```
 
 The `--eval-weights` argument takes a dictionary mapping tick offsets to weight vectors, allowing arbitrary preference schedules within a single episode.
+
+### Recreating the figures
+
+The data used to generate all figures is included under `experiments/paper/data/`. To recreate the figures, install the plotting dependencies and run the plotting scripts from within `experiments/paper/` (the figures will be saved to `experiments/paper/figures/`):
+
+```bash
+cd experiments/paper
+uv sync
+```
+
+The exact commands are documented as comments at the bottom of [`plot_curves.py`](experiments/paper/plot_curves.py) (training curves and dynamic adaptation reward plot) and [`plot_metrics.py`](experiments/paper/plot_metrics.py) (static adaptation Pareto fronts, metric bars, and correlation plots).
+
+The static adaptation data (`data/static_adaptation/`) was produced by [`run_static_adaptation_experiment.py`](experiments/paper/run_static_adaptation_experiment.py), which evaluates trained models across a grid of preference weights. Training curve data (`data/training/`) was collected from WandB, and the dynamic adaptation data (`data/dynamic_adaptation/`) was generated manually by using `puffer eval [...]` commands.
 
 ---
 

@@ -12,7 +12,7 @@ logging.basicConfig(
 )
 
 NUM_EVAL_WEIGHTS = 30
-OUTPUT_DIR = "adaptation_experiments_results"
+OUTPUT_DIR = "./data/static_adaptation"
 
 REWARD_DIM_PER_ENV = {
     "puffer_moba_mo": 3,
