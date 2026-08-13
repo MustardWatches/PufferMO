@@ -497,7 +497,6 @@ class Multiprocessing:
         o = buf['observations'][w_slice].reshape(self.obs_batch_shape)
         if self.multiobjective_reward:
             r = buf['rewards'][w_slice].reshape(self.rew_batch_shape)
-            # r = r.sum(axis=1)  # TODO PHM: This is for testing only, remove for MOPPO
             w = buf['weights'][w_slice].reshape(self.rew_batch_shape)
         else:
             r = buf['rewards'][w_slice].ravel()
