@@ -1,11 +1,14 @@
-import pandas as pd
-import matplotlib.pyplot as plt
 import argparse
-import os
 import glob
+import os
+
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
+import pandas as pd
 
 STEP_KEYS = ["_step", "Step"]
+FONT = "times"  # "lucidabr" or "times"
 
 COLORS_BY_NAME = {
     "RED": "#FF0F19",
@@ -22,10 +25,13 @@ DEFAULT_COLOR_CYCLE = [
     for color in ["BLUE", "ORANGE", "GREEN", "RED", "PURPLE", "TEAL", "BLACK"]
 ]
 
+SPINE_PADDING = 0.15
+SPINE_PADDING_BOTTOM = 0.05
+
 COLORS_BY_LABEL = {
-    "PPO": "#1f77b4",
-    "MOPPO": "#d62728",
-    "MOPPO (no conditioning)": "#2ca02c",
+    "PPO": "#65a98f",
+    "MOPPO (no conditioning)": "#0757b9",
+    "MOPPO": "#ff8c00"
 }
 
 OBJECTIVE_LABELS = {
@@ -52,7 +58,7 @@ def prettify_label(label):
 
 
 def order_from_labels(labels):
-    return [labels.index(label) for label in COLORS_BY_LABEL.keys() if label in labels]
+    return [labels.index(label) for label in COLORS_BY_LABEL if label in labels]
 
 
 def setup_plot_style():
@@ -60,7 +66,7 @@ def setup_plot_style():
     plt.rcParams.update(
         {
             "text.usetex": True,
-            "text.latex.preamble": r"\usepackage{amsmath}",
+            "text.latex.preamble": rf"\usepackage[T1]{{fontenc}}\usepackage{{amsmath}}\usepackage{{{FONT}}}",
             "font.family": "sans-serif",
             "font.size": 10,
             "axes.titlesize": 10,
@@ -74,7 +80,7 @@ def setup_plot_style():
 
 
 def get_env_name_from_path(args):
-    for name in OBJECTIVE_LABELS.keys():
+    for name in OBJECTIVE_LABELS:
         if name in args.path.lower():
             return name
     return ""
@@ -83,6 +89,39 @@ def get_env_name_from_path(args):
 def smooth_data(series, weight=0.9):
     """Exponential moving average smoothing (from plots.py)."""
     return series.ewm(alpha=1 - weight).mean()
+
+
+def align_axis_labels(fig, ax, gap=14):
+    """Anchor axis labels a fixed display-space gap from the visible spines."""
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    axes_bbox = ax.get_window_extent(renderer)
+    bottom_edge = (
+        ax.spines["bottom"].get_window_extent(renderer)
+        if ax.spines["bottom"].get_visible()
+        else axes_bbox
+    )
+    left_edge = (
+        ax.spines["left"].get_window_extent(renderer)
+        if ax.spines["left"].get_visible()
+        else axes_bbox
+    )
+
+    x_label_y = bottom_edge.y0 - gap
+    x_center = (bottom_edge.x0 + bottom_edge.x1) / 2
+    x_label_x, x_axes_coord = ax.transAxes.inverted().transform(
+        (x_center, x_label_y)
+    )
+    ax.xaxis.set_label_coords(x_label_x, x_axes_coord)
+    ax.xaxis.label.set_verticalalignment("top")
+
+    y_label_x = left_edge.x0 - gap
+    y_center = (left_edge.y0 + left_edge.y1) / 2
+    y_axes_coord, y_label_y = ax.transAxes.inverted().transform(
+        (y_label_x, y_center)
+    )
+    ax.yaxis.set_label_coords(y_axes_coord, y_label_y)
+    ax.yaxis.label.set_horizontalalignment("center")
 
 
 def main(args):
@@ -110,7 +149,7 @@ def main(args):
     # Apply style
     try:
         setup_plot_style()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"Warning: Could not apply tex style: {e}")
 
     # Store processed data for plotting
@@ -118,8 +157,6 @@ def main(args):
     max_step = 0
 
     for i, file_path in enumerate(files):
-        print(f"Processing {file_path}...")
-
         # Parse CSV data
         try:
             df = pd.read_csv(file_path, quotechar='"', skipinitialspace=True)
@@ -129,7 +166,7 @@ def main(args):
             assert step_key is not None, f"No step key found in {file_path}"
 
             df = df.sort_values(step_key)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Error reading {file_path}: {e}")
             continue
 
@@ -190,9 +227,8 @@ def main(args):
                 )
 
         # Update max step for scaling
-        if not df.empty:
-            if step_key:
-                max_step = max(max_step, df[step_key].max())
+        if not df.empty and step_key:
+            max_step = max(max_step, df[step_key].max())
 
     # Determine scale factor for x-axis
     if max_step > 0:
@@ -241,6 +277,8 @@ def main(args):
                 alpha=0.2,
                 linewidth=0,
             )
+            item["band_min"] = plot_lower.min()
+            item["band_max"] = plot_upper.max()
 
     # Add vertical markers if specified
     for vm in args.vertical_markers:
@@ -248,14 +286,55 @@ def main(args):
 
     process = args.process
     xlabel = (
-        f"{process} step ($\\times 10^{{{exponent}}}$)"
+        f"{process} step ($\\mathsf{{\\times 10^{{{exponent}}}}}$)"
         if exponent != 0
         else f"{process} step"
     )
     plt.xlabel(xlabel)
     plt.ylabel(metric_name.lower())
 
-    plt.grid(True, linestyle="-", alpha=0.2)
+    ax = plt.gca()
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(False)
+    ax.spines["bottom"].set_linewidth(1.2)
+    ax.spines["left"].set_linewidth(1.2)
+
+    # Bound spines to data extremes and show only limit ticks
+    all_x = np.concatenate([d["df"][step_key].values / scale for d in plot_data])
+    all_y = np.concatenate([d["df"]["mean"].values for d in plot_data])
+    x_min, x_max = all_x.min(), all_x.max()
+    y_min, y_max = all_y.min(), all_y.max()
+    if abs(x_min - round(x_min)) < 0.05:
+        x_min = float(round(x_min))
+    if abs(x_max - round(x_max)) < 0.05:
+        x_max = float(round(x_max))
+    ax.spines["bottom"].set_bounds(x_min, x_max)
+    ax.spines["left"].set_bounds(y_min, y_max)
+    ax.spines["bottom"].set_position(("outward", 16))
+    ax.spines["left"].set_position(("outward", 16))
+
+    # Fix the y-spine's fraction of the axes height regardless of std-band
+    # overshoot, so spines look similarly sized across envs/metrics with
+    # different variance instead of being squashed by wide std bands.
+    # Widen the limits further if the bands themselves
+    # extend past the padding so they never get clipped.
+    y_range = y_max - y_min
+    band_min = min((d["band_min"] for d in plot_data if "band_min" in d), default=y_min)
+    band_max = max((d["band_max"] for d in plot_data if "band_max" in d), default=y_max)
+    ylim_low = min(y_min - SPINE_PADDING_BOTTOM * y_range, band_min)
+    ylim_high = max(y_max + SPINE_PADDING * y_range, band_max)
+    ax.set_ylim(ylim_low, ylim_high)
+    ax.set_xticks([x_min, x_max])
+    ax.set_yticks([y_min, y_max])
+    formatter = mticker.FormatStrFormatter("%.3g")
+    y_formatter = mticker.FuncFormatter(
+        lambda value, position: "0" if abs(value) <= 1e-3 else f"{value:.3g}"
+    )
+    ax.xaxis.set_major_formatter(formatter)
+    ax.yaxis.set_major_formatter(y_formatter)
+    ax.xaxis.set_tick_params(direction="in", length=4, labelbottom=True, width=1.2, pad=12)
+    ax.yaxis.set_tick_params(direction="in", length=4, labelleft=True, width=1.2, pad=12)
 
     if not args.disable_legend:
         # Define label order
@@ -263,14 +342,16 @@ def main(args):
         order = order_from_labels(labels)
         handles = [handles[idx] for idx in order]
         labels = [labels[idx] for idx in order]
-        plt.legend(handles, labels, loc="lower right")
+        plt.legend(handles, labels, loc="lower right", frameon=False)
     plt.tight_layout()
+    align_axis_labels(plt.gcf(), ax)
 
     env_name = args.env_name or get_env_name_from_path(args)
+    image_format = (args.format or "pdf").lower().lstrip(".")
     file_name = (
         f"plot_{metric_name.replace(' ', '_')}"
         + (f"_{env_name}" if env_name else "")
-        + ".png"
+        + f".{image_format}"
     )
 
     output_file = os.path.join(output_path, file_name)
@@ -337,18 +418,24 @@ if __name__ == "__main__":
         default="",
         help="Output directory for the plot",
     )
+    parser.add_argument(
+        "--format",
+        type=str,
+        default="pdf",
+        help="Output file format for the saved plot (default: pdf)",
+    )
     args = parser.parse_args()
     main(args)
 
 # Commands used to generate the plots in the paper:
 """
 # Performance and discounted returns during training
-uv run python plot_curves.py --path ./data/training/moba/discounted_return   --output-path ./figures/training           --process training --aggregate --std-bands --metric-name "discounted episode return" --disable-legend
+uv run python plot_curves.py --path ./data/training/moba/discounted_return   --output-path ./figures/training           --process training --aggregate --std-bands --disable-legend --metric-name "disc return"
 uv run python plot_curves.py --path ./data/training/moba/performance         --output-path ./figures/training           --process training --aggregate --std-bands
-uv run python plot_curves.py --path ./data/training/snake/discounted_return  --output-path ./figures/training           --process training --aggregate --std-bands --metric-name "discounted episode return"
-uv run python plot_curves.py --path ./data/training/snake/performance        --output-path ./figures/training           --process training --aggregate --std-bands
-uv run python plot_curves.py --path ./data/training/tetris/discounted_return --output-path ./figures/training           --process training --aggregate --std-bands --metric-name "discounted episode return" --disable-legend
-uv run python plot_curves.py --path ./data/training/tetris/performance       --output-path ./figures/training           --process training --aggregate --std-bands                                           --disable-legend
+uv run python plot_curves.py --path ./data/training/snake/discounted_return  --output-path ./figures/training           --process training --aggregate --std-bands --disable-legend --metric-name "disc return"
+uv run python plot_curves.py --path ./data/training/snake/performance        --output-path ./figures/training           --process training --aggregate --std-bands --disable-legend
+uv run python plot_curves.py --path ./data/training/tetris/discounted_return --output-path ./figures/training           --process training --aggregate --std-bands --disable-legend --metric-name "disc return"
+uv run python plot_curves.py --path ./data/training/tetris/performance       --output-path ./figures/training           --process training --aggregate --std-bands --disable-legend
 # Reward plot for the dynamic adaptation experiment
-uv run python plot_curves.py --path ./data/dynamic_adaptation                --output-path ./figures/dynamic_adaptation --process episode --exclude-columns weights --smooth 0.99 --disable-legend --normalize --vertical-markers 500 --colors BLUE PURPLE ORANGE
+uv run python plot_curves.py --path ./data/dynamic_adaptation                --output-path ./figures/dynamic_adaptation --process episode                          --disable-legend --metric-name "reward"      --exclude-columns weights --smooth 0.99 --normalize --vertical-markers 500 --colors BLUE PURPLE ORANGE
 """

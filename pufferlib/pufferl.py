@@ -235,7 +235,6 @@ class PuffeRL:
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
         self.print_dashboard(clear=True)
 
-    # TODO PHM: This whole weight setting can go now
     def set_weights(self, weights):
         # Set weights on the vectorized environment
         eval_weights_np = np.asarray(weights, dtype=np.float32)
