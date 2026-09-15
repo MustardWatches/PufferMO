@@ -128,6 +128,8 @@ MAKE_FUNCTIONS = {
     'tetris': 'Tetris',
     'tetris_mo': 'TetrisMO',
     'cartpole': 'Cartpole',
+    'kinematic_bicycle': 'KinematicBicycle',
+    'kinematic_bicycle_integral': 'KinematicBicycleIntegral',
     'moba': 'Moba',
     'moba_mo': 'MobaMO',
     'matsci': 'Matsci',
