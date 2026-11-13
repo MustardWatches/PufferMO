@@ -7,7 +7,7 @@ on:
 jobs:
   test:
     name: test ${{ matrix.py }} - ${{ matrix.os }} - ${{ matrix.env }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && matrix.py == '3.9' && matrix.env == 'pip' && 'ubuntu-24.04' || matrix.os }}
     strategy:
       fail-fast: false
       matrix:
